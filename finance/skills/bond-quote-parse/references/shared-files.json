@@ -1,0 +1,26 @@
+{
+  "schema_version": "1.0",
+  "description": "以下文件与内部完整版故意保持一致，仅为输入模板、契约与共用脚本，不含 system prompt、Few-shot 案例库或内部 API 文档。",
+  "shared_files": [
+    "REDACTION.md",
+    "assets/empty-bccp.json",
+    "assets/empty-bccp.yaml",
+    "assets/empty-chat-grid.csv",
+    "assets/empty-chat-grid.xlsx",
+    "assets/empty-chat-template.md",
+    "assets/sample-bccp.json",
+    "assets/sample-bccp.yaml",
+    "assets/sample-chat-grid.csv",
+    "assets/sample-chat-grid.xlsx",
+    "assets/sample-chat-template.md",
+    "references/chat-export-template.csv",
+    "references/config.example.env",
+    "references/input-schema-v1.json",
+    "references/output-schema-v1.json",
+    "references/sample-bccp-minimal.json",
+    "references/shared-files.json",
+    "scripts/bccp_from_csv.py",
+    "scripts/submit_parse.py",
+    "scripts/validate_bccp.py"
+  ]
+}

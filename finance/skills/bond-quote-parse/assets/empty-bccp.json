@@ -1,0 +1,11 @@
+{
+  "schema_version": "1.0",
+  "client_request_id": "",
+  "bond_context": {
+    "room_name": "",
+    "issuer": "",
+    "tranches": []
+  },
+  "parse_options": {},
+  "messages": []
+}

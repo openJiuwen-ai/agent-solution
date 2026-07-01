@@ -1,0 +1,28 @@
+{
+  "schema_version": "1.0",
+  "client_request_id": "sample-demo",
+  "bond_context": {
+    "room_name": "示例申购群",
+    "tranches": [{ "tranche_name": "24示例01" }]
+  },
+  "messages": [
+    {
+      "message_id": "c-0001",
+      "corpus_id": 1,
+      "corpus_type": 2,
+      "speak_time": "2026-06-02 09:30:00",
+      "raw_content": "【发行】24示例01 5Y 规模10亿（示例，请替换为真实小广告）"
+    },
+    {
+      "message_id": "c-0002",
+      "corpus_id": 2,
+      "corpus_type": 1,
+      "speaker_id": "wx_demo_01",
+      "speaker_name": "交易员甲",
+      "institution_name": "示例券商",
+      "speak_time": "2026-06-02 10:05:00",
+      "raw_content": "2.65% 5kw 账户4"
+    }
+  ],
+  "parse_options": { "debug": false }
+}

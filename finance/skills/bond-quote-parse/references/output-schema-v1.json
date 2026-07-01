@@ -1,0 +1,51 @@
+{
+  "description": "POST /api/v1/parse/batch 响应 data 字段",
+  "properties": {
+    "schema_version": { "type": "string" },
+    "client_request_id": { "type": "string" },
+    "job_id": { "type": "string" },
+    "status": { "enum": ["completed"] },
+    "summary": {
+      "type": "object",
+      "properties": {
+        "total_quote_messages": { "type": "integer" },
+        "success": { "type": "integer" },
+        "failed": { "type": "integer" }
+      }
+    },
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "message_id": { "type": "string" },
+          "corpus_id": { "type": "integer" },
+          "success": { "type": "boolean" },
+          "error_message": { "type": "string" },
+          "parse_results": { "type": "array" }
+        }
+      }
+    },
+    "quotes_table": {
+      "type": "array",
+      "description": "扁平化报价行；展示时须使用下方中文列名",
+      "items": {
+        "type": "object",
+        "properties": {
+          "institution_name": { "label_zh": "机构名称" },
+          "tranche_name": { "label_zh": "债券品种" },
+          "bid_rate": { "label_zh": "标位(%)" },
+          "bid_quantity": { "label_zh": "投标量(万)" },
+          "account": { "label_zh": "账户" },
+          "volume_raw": { "label_zh": "量原文" },
+          "limit_ratio": { "label_zh": "限比", "note": "限比规则 ID（如 a1），勿标为「限制」" },
+          "avoid_institution": { "label_zh": "避开" },
+          "custom_remark": { "label_zh": "备注" },
+          "holding_type": { "label_zh": "持仓" },
+          "status": { "label_zh": "状态", "note": "new/modify/cancel 可译为 新增/修改/撤销" }
+        }
+      }
+    },
+    "parser_mode": { "enum": ["llm", "regex"] }
+  }
+}

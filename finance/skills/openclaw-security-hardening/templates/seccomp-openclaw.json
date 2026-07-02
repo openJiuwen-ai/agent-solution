@@ -1,0 +1,30 @@
+{
+  "names": [
+    "accept", "accept4", "access", "adjtimex", "alarm", "bind", "brk",
+    "capget", "capset", "chdir", "chmod", "chown", "chown32",
+    "clock_getres", "clock_gettime", "clock_nanosleep", "close", "connect", "creat",
+    "dup", "dup2", "dup3", "epoll_create1", "epoll_ctl", "epoll_wait",
+    "execve", "exit", "exit_group", "faccessat", "fchdir", "fchmod", "fchown", "fchown32",
+    "fcntl", "fcntl64", "fdatasync", "fgetxattr", "flock", "fork",
+    "fstat", "fstat64", "fstatfs", "fstatfs64", "fsync", "ftruncate", "ftruncate64", "futex",
+    "getcwd", "getdents", "getdents64", "getegid", "getegid32", "geteuid", "geteuid32",
+    "getgid", "getgid32", "getgroups", "getgroups32", "getitimer", "getpeername",
+    "getpgid", "getpgrp", "getpid", "getppid", "getpriority", "getresgid", "getresuid",
+    "getrlimit", "getrusage", "getsockname", "getsockopt", "getuid", "getuid32", "gettimeofday",
+    "ioctl", "ipc", "kill", "lchown", "lchown32", "link", "listen", "lseek",
+    "lstat", "lstat64", "madvise", "mincore", "mkdir", "mknod", "mmap", "mmap2",
+    "mprotect", "munmap", "nanosleep", "newfstatat", "open", "openat", "pause",
+    "pipe", "pipe2", "poll", "ppoll", "prctl", "pread64", "preadv", "prlimit64",
+    "pselect6", "pwrite64", "pwritev", "read", "readlink", "readlinkat",
+    "recvfrom", "recvmsg", "rename", "renameat", "rmdir", "rt_sigaction",
+    "rt_sigprocmask", "rt_sigreturn", "select", "semget", "semop",
+    "sendfile", "sendfile64", "sendmsg", "sendto", "setfsgid", "setfsuid",
+    "setgid", "setgroups", "setitimer", "setpgid", "setpriority",
+    "setresgid", "setresuid", "setrlimit", "setsid", "setsockopt", "setuid",
+    "shutdown", "sigaltstack", "signalfd4", "sigreturn", "socket", "socketpair",
+    "stat", "stat64", "statfs", "statfs64", "symlink", "sysinfo", "time",
+    "timer_create", "timer_delete", "timer_settime", "times", "umask", "uname",
+    "unlink", "utime", "wait4", "waitpid", "write", "writev"
+  ],
+  "defaultErrno": 1
+}

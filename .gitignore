@@ -37,3 +37,11 @@ logs/
 # Cache
 .cache/
 *.cache
+
+# Excel lock / temp files
+~$*.xlsx
+~$*.xls
+
+# Methodology runtime output
+finance/methodology/相似问质检/output/*
+!finance/methodology/相似问质检/output/.gitkeep

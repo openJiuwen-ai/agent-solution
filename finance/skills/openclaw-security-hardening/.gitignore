@@ -1,0 +1,21 @@
+# Reports output
+reports/
+*.log
+
+# Backup files
+backups/
+*.bak
+*.tgz
+
+# State files
+*-state-*.json
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*~

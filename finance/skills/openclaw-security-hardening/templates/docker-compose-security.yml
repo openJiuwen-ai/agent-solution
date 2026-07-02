@@ -1,0 +1,41 @@
+# OpenClaw Security-Hardened Docker Compose
+# For containerized deployment on Rocky Linux, L4+ security
+version: '3.8'
+
+services:
+  openclaw:
+    image: openclaw/openclaw:latest
+    container_name: openclaw
+    restart: unless-stopped
+    # Run as non-root user for security
+    user: "1000:1000"
+    # Read-only root filesystem (L4+ requirement)
+    read_only: true
+    # tmpfs for temporary files (noexec, nosuid)
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=100m
+      - /run:rw,noexec,nosuid,size=50m
+    # Security options
+    security_opt:
+      - seccomp:./seccomp-openclaw.json
+      - apparmor:docker-openclaw
+    # Resource limits (prevent resource exhaustion)
+    mem_limit: 512m
+    cpus: 0.5
+    pids_limit: 100
+    # Network isolation (use none for maximum security, only outbound when needed)
+    network_mode: "none"
+    # If you need outbound network for API calls, use bridge and restrict via iptables
+    # network_mode: "bridge"
+    # Volumes (persist data only where needed)
+    volumes:
+      - "openclaw-data:/home/openclaw/.openclaw:ro"
+      # Only write permission needed for logs:
+      - "openclaw-logs:/home/openclaw/.openclaw/logs:rw"
+    # Environment (pull secrets from .env, never bake into image)
+    env_file:
+      - ../.env
+
+volumes:
+  openclaw-data:
+  openclaw-logs:

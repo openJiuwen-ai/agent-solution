@@ -37,11 +37,3 @@ logs/
 # Cache
 .cache/
 *.cache
-
-# Excel lock / temp files
-~$*.xlsx
-~$*.xls
-
-# Methodology runtime output
-finance/methodology/similar-query-qc/output/*
-!finance/methodology/similar-query-qc/output/.gitkeep

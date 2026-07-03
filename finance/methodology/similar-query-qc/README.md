@@ -13,21 +13,22 @@
 ## 目录结构
 
 ```
-相似问质检/
+similar-query-qc/
 ├── README.md
 ├── requirements.txt
 ├── scripts/
-│   └── query意图匹配判定.py    # 主脚本
+│   └── evaluate_query_intent_match.py
 ├── references/
-│   ├── menu_desc.xlsx          # 意图名称与描述对照表
-│   └── 待判定数据.xlsx          # 输入样例
-└── output/                     # 运行产物（不纳入版本库）
-    └── 判定结果.xlsx
+│   ├── intent_match_prompt.txt   # LLM prompt template
+│   ├── menu_desc.xlsx              # Intent name and description mapping
+│   └── input_samples.xlsx          # Input sample data
+└── output/                         # Runtime artifacts (gitignored)
+    └── evaluation_results.xlsx
 ```
 
 ## 输入
 
-### 1. `references/待判定数据.xlsx`
+### 1. `references/input_samples.xlsx`
 
 | 列名 | 说明 |
 |------|------|
@@ -43,7 +44,7 @@
 
 ## 输出
 
-`output/判定结果.xlsx`：
+`output/evaluation_results.xlsx`：
 
 | 列名 | 说明 |
 |------|------|
@@ -55,7 +56,7 @@
 ## 使用方式
 
 ```bash
-cd finance/methodology/相似问质检
+cd finance/methodology/similar-query-qc
 pip install -r requirements.txt
 
 # 配置 LLM（示例：智谱 OpenAI 兼容接口）
@@ -63,10 +64,10 @@ export LLM_API_KEY="your-api-key"
 # 可选：export LLM_MODEL="glm-5.1"
 # 可选：export LLM_API_BASE="https://open.bigmodel.cn/api/paas/v4/"
 
-python scripts/query意图匹配判定.py
+python scripts/evaluate_query_intent_match.py
 ```
 
-将待判定数据放入 `references/待判定数据.xlsx`（或替换为自有文件并修改脚本中的 `INPUT_FILE`），运行后查看 `output/判定结果.xlsx`。
+将待判定数据放入 `references/input_samples.xlsx`（或替换为自有文件并修改脚本中的 `INPUT_FILE`），运行后查看 `output/evaluation_results.xlsx`。
 
 ## 判定规则
 

@@ -43,5 +43,5 @@ logs/
 ~$*.xls
 
 # Methodology runtime output
-finance/methodology/相似问质检/output/*
-!finance/methodology/相似问质检/output/.gitkeep
+finance/methodology/similar-query-qc/output/*
+!finance/methodology/similar-query-qc/output/.gitkeep

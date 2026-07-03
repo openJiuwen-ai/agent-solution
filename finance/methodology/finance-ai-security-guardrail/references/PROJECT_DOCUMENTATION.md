@@ -100,7 +100,7 @@
 ### 2.2 项目目录结构
 
 ```
-finance-guardrail_3690/
+finance-guardrail/
 ├── config/                    # 配置模块
 │   ├── __init__.py
 │   └── config.py              # 系统配置、API密钥、安全规则
@@ -206,7 +206,7 @@ finance-guardrail_3690/
 #### 1. 克隆项目
 
 ```bash
-cd d:\AI_Training\finance-guardrail_3690
+cd finance-guardrail
 ```
 
 #### 2. 创建虚拟环境
@@ -641,4 +641,4 @@ python -m pytest test/test_guardrails.py -v
 
 **文档版本**: v1.0  
 **生成时间**: 2026年  
-**项目地址**: `d:\AI_Training\finance-guardrail_3690`
+**项目地址**: `<your-project-path>/finance-guardrail`

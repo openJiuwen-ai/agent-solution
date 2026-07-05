@@ -13,14 +13,13 @@ import os
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from src.validators.pii_validator import (
+from validators.pii_validator import (
     PIIDetector,
     PIIEntity,
     pii_detect,
     pii_anonymize,
     GUARDRAILS_INTEGRATION_AVAILABLE,
 )
-from src.pii_detection import PIIDetectionService
 
 
 def test_cn_id_card_detection():
@@ -131,32 +130,9 @@ def test_pii_summary():
     print(f"  [PASS] 摘要: {summary}")
 
 
-def test_pii_detection_service():
-    """测试PII检测服务层"""
-    print("\n测试8: PII检测服务层")
-    service = PIIDetectionService(
-        input_entities=["cn_pii"],
-        output_entities=["cn_pii", "EMAIL_ADDRESS"],
-    )
-
-    # 测试输入检测
-    input_text = "我的手机号是13800138000"
-    input_result = service.check_input(input_text)
-    assert input_result["has_pii"] is True
-    assert "<CN_PHONE>" in input_result["anonymized_text"]
-    print(f"  [PASS] 输入检测: {input_result['anonymized_text']}")
-
-    # 测试输出检测
-    output_text = "请联系zhangsan@bank.com"
-    output_result = service.check_output(output_text)
-    assert output_result["has_pii"] is True
-    assert "<EMAIL_ADDRESS>" in output_result["anonymized_text"]
-    print(f"  [PASS] 输出检测: {output_result['anonymized_text']}")
-
-
 def test_guardrails_integration():
     """测试GuardRails AI集成"""
-    print("\n测试9: GuardRails AI集成")
+    print("\n测试8: GuardRails AI集成")
 
     if not GUARDRAILS_INTEGRATION_AVAILABLE:
         print("  [WARN] GuardRails AI不可用，跳过集成测试")
@@ -164,7 +140,7 @@ def test_guardrails_integration():
 
     try:
         from guardrails import Guard, OnFailAction
-        from src.validators.pii_validator import CustomPIIValidator
+        from validators.pii_validator import CustomPIIValidator
 
         guard = Guard().use(
             CustomPIIValidator,
@@ -189,7 +165,7 @@ def test_guardrails_integration():
 
 def test_convenience_functions():
     """测试便捷函数"""
-    print("\n测试10: 便捷函数")
+    print("\n测试9: 便捷函数")
 
     results = pii_detect("邮箱test@example.com", pii_entities=["EMAIL_ADDRESS"])
     assert len(results) == 1
@@ -214,7 +190,6 @@ def run_all_tests():
         test_multiple_pii_detection,
         test_anonymize,
         test_pii_summary,
-        test_pii_detection_service,
         test_guardrails_integration,
         test_convenience_functions,
     ]

@@ -61,6 +61,10 @@ class ResolvedOptimizationConfig:
     trace_retry_backoff: float
     tie_reval_eps: float
     extra_hyperparams: dict[str, Any]
+    # managed-doc 模式目标 kind（精确 doc_kind）。None 走 Skill 路径。
+    # 不进入 optimizer_runtime_dependencies()——operator 在 optimizer deps
+    # 构造前已创建，该字段供 runner builder 分支直接消费。
+    managed_doc_kind: str | None = None
 
     def optimizer_runtime_dependencies(self) -> dict[str, Any]:
         """Return scalar optimizer constructor kwargs owned by runtime config."""
@@ -167,6 +171,7 @@ class OptimizationConfigResolver:
             agent_name=request.agent_name,
             optimizer_type=request.optimizer_type,
             skills=tuple(request.skills),
+            managed_doc_kind=request.managed_doc_kind,
             dataset_path=request.dataset_path,
             dataset_manifest_path=request.dataset_manifest_path,
             evaluator_prompt=request.evaluator_prompt,

@@ -213,3 +213,55 @@ def test_optimizer_runtime_dependencies_contains_preserve_frontmatter(
     deps = resolved.optimizer_runtime_dependencies()
     assert "preserve_frontmatter" in deps
     assert deps["preserve_frontmatter"] is True
+
+
+# ── managed-doc: F2 透传 managed_doc_kind ──
+
+
+def test_resolve_passes_managed_doc_kind(tmp_path: Path, scenarios_dir: Path) -> None:
+    """managed_doc_kind 经 resolve 抵达 ResolvedOptimizationConfig（runner builder 直接消费）。"""
+    resolved = _resolver(tmp_path, scenarios_dir).resolve(
+        OptimizeRequest(
+            scenario="edp_agent",
+            agent_name="agent",
+            managed_doc_kind="agent_rule",
+        )
+    )
+    assert resolved.managed_doc_kind == "agent_rule"
+
+
+def test_resolve_managed_doc_kind_default_none(tmp_path: Path, scenarios_dir: Path) -> None:
+    """不传 managed_doc_kind 时 resolved.managed_doc_kind 为 None（Skill 路径）。"""
+    resolved = _resolver(tmp_path, scenarios_dir).resolve(
+        OptimizeRequest(scenario="edp_agent", agent_name="agent", skills=["skill_a"])
+    )
+    assert resolved.managed_doc_kind is None
+
+
+def test_resolve_strips_managed_doc_kind(tmp_path: Path, scenarios_dir: Path) -> None:
+    """resolve 透传时 managed_doc_kind 已由 OptimizeRequest 构造时 strip。"""
+    resolved = _resolver(tmp_path, scenarios_dir).resolve(
+        OptimizeRequest(
+            scenario="edp_agent",
+            agent_name="agent",
+            managed_doc_kind="  agent_rule  ",
+        )
+    )
+    assert resolved.managed_doc_kind == "agent_rule"
+
+
+def test_optimizer_runtime_dependencies_excludes_managed_doc_kind(
+    tmp_path: Path, scenarios_dir: Path
+) -> None:
+    """managed_doc_kind 不属于 SkillDocumentOptimizer 构造参数，
+    不进入 optimizer_runtime_dependencies()——operator 在 optimizer dependencies
+    构造前已创建，该字段供 runner builder 分支用。"""
+    resolved = _resolver(tmp_path, scenarios_dir).resolve(
+        OptimizeRequest(
+            scenario="edp_agent",
+            agent_name="agent",
+            managed_doc_kind="agent_rule",
+        )
+    )
+    deps = resolved.optimizer_runtime_dependencies()
+    assert "managed_doc_kind" not in deps

@@ -11,7 +11,24 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
-from evo_agent.adapter_client.operator import split_frontmatter
+
+def split_frontmatter(content: str) -> tuple[str, str]:
+    """Split a markdown document into YAML frontmatter and body.
+
+    Returns ``(frontmatter, body)``. If the document has no leading YAML
+    frontmatter, returns ``("", content)``. Defined in this leaf module so
+    ``operator.py`` and ``content_policy.py`` can share it without a circular
+    import (operator imports from content_policy, not the reverse).
+    """
+    lines = content.splitlines(keepends=True)
+    if not lines or lines[0].strip() != "---":
+        return "", content
+
+    for index in range(1, len(lines)):
+        if lines[index].strip() == "---":
+            return "".join(lines[: index + 1]), "".join(lines[index + 1 :])
+
+    return "", content
 
 
 class ContentPolicyError(Exception):

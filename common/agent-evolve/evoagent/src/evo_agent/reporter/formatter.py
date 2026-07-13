@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import difflib
+import hashlib
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
 from evo_agent.types import OptimizeReport, SkillContentSnapshot, SkillScore, TrainResult, ValResult
+
+logger = logging.getLogger(__name__)
 
 
 class ReportFormatter:
@@ -70,6 +75,20 @@ class ReportFormatter:
         train = self._collect_train_result(skill_scores)
         val = self._collect_val_result()
 
+        # managed-doc 成功路径 artifact（spec F8）：写 final.md + diff.patch。
+        # before.md / tasks.json 由 runner（baseline + finally）负责；formatter 只读
+        # 成功结果。日志只记 hash + 长度 + task_id，不记全文（ADR §10）。
+        managed_doc_after = self._managed_doc_content_after
+        if self._managed_doc_kind is not None:
+            self._write_managed_doc_artifacts()
+
+        md_kwargs: dict[str, Any] = {
+            "managed_doc_kind": self._managed_doc_kind,
+            "managed_doc_content_before": self._managed_doc_content_before,
+            "managed_doc_content_after": managed_doc_after,
+            "managed_doc_task_ids": self._managed_doc_task_ids,
+        }
+
         if skill_scores:
             # 多 skill 模式
             total_edits = sum(s.edits_applied for s in skill_scores)
@@ -85,6 +104,7 @@ class ReportFormatter:
                 artifact_dir=self._artifact_dir,
                 skill_scores=tuple(skill_scores),
                 skill_contents=tuple(self._collect_skill_contents()),
+                **md_kwargs,
             )
 
         # 单 skill 模式（向下兼容）
@@ -98,6 +118,46 @@ class ReportFormatter:
             gate_results=tuple(gate_results),
             artifact_dir=self._artifact_dir,
             skill_contents=tuple(self._collect_skill_contents()),
+            **md_kwargs,
+        )
+
+    def _write_managed_doc_artifacts(self) -> None:
+        """成功路径写 managed_doc_final.md + managed_doc_diff.patch（spec F8）。
+
+        参照 edp_agent ``_write_per_operator_snapshots`` 的 before/after/diff 模式。
+        before 由 runner baseline 阶段写入（formatter 只读不写 before）。日志只记
+        hash + 长度 + task_id，**不输出全文** managed-doc（ADR §10 / F8 AC）。
+        """
+        before = self._managed_doc_content_before or ""
+        after = self._managed_doc_content_after or ""
+        before_hash = hashlib.sha256(before.encode("utf-8")).hexdigest()
+        after_hash = hashlib.sha256(after.encode("utf-8")).hexdigest()
+        self._artifact_dir.mkdir(parents=True, exist_ok=True)
+        (self._artifact_dir / "managed_doc_final.md").write_text(after, encoding="utf-8")
+        diff = difflib.unified_diff(
+            before.splitlines(keepends=True),
+            after.splitlines(keepends=True),
+            fromfile="managed_doc_before",
+            tofile="managed_doc_final",
+        )
+        (self._artifact_dir / "managed_doc_diff.patch").write_text("".join(diff), encoding="utf-8")
+        logger.info(
+            "managed-doc artifacts written: kind=%s before_hash=%s before_length=%d "
+            "after_hash=%s after_length=%d task_ids=%s",
+            self._managed_doc_kind,
+            before_hash,
+            len(before),
+            after_hash,
+            len(after),
+            list(self._managed_doc_task_ids),
+            extra={
+                "managed_doc_kind": self._managed_doc_kind,
+                "before_hash": before_hash,
+                "before_length": len(before),
+                "after_hash": after_hash,
+                "after_length": len(after),
+                "task_ids": list(self._managed_doc_task_ids),
+            },
         )
 
     # ── Train / Val 结果 ────────────────────────────────────────────

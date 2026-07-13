@@ -1386,3 +1386,115 @@ async def test_runner_passes_canonical_id_to_evaluator_via_skill_names(
     # RemoteAgent operators 唯一 key 即 canonical id（单 operator short-circuit 命中）
     operators = h.ra_cls.call_args.kwargs["operators"]
     assert list(operators.keys()) == ["managed_doc:agent_rule"]
+
+
+# ── managed-doc runner 失败路径 artifact（spec F8）──
+
+
+def _md_record(*, task_id: str | None = None, phase: str = "failed_poll") -> Any:
+    """构造一条 ManagedDocApplyRecord（finally tasks.json ledger 数据源）。"""
+    from evo_agent.adapter_client.applier import ManagedDocApplyRecord
+
+    return ManagedDocApplyRecord(
+        phase=phase,
+        content_hash="abc123",
+        task_id=task_id,
+        status="FAILED",
+        noop=False,
+        recovered=False,
+        error="failed_poll: task FAILED",
+        adapter_error="adapter task failed",
+        post_time=0.1,
+        poll_time=1.5,
+        total_time=1.6,
+    )
+
+
+async def test_runner_failure_after_valid_baseline_writes_before_and_task_ledger(
+    tmp_path: Path,
+    make_harness: Callable[[], SimpleNamespace],
+) -> None:
+    """有效 baseline 建立后 apply 失败：before.md + tasks.json 落盘（finally）。"""
+    from evo_agent.errors import ManagedDocApplyError
+
+    snap = _make_valid_snapshot()
+    h = _md_harness_with_snapshot(make_harness, snap)
+    # applier 已有一条失败 record（含 task_id）→ finally tasks.json 应含该 task_id
+    h.md_op.applier.records = (_md_record(task_id="task-failed"),)
+    # 训练阶段 apply 失败 → fatal 抛出
+    h.trainer_cls.return_value.train.side_effect = ManagedDocApplyError(
+        agent_name="test_agent",
+        doc_kind="agent_rule",
+        task_id="task-failed",
+        phase="failed_poll",
+        adapter_error="adapter task failed",
+    )
+    with pytest.raises(ManagedDocApplyError):
+        await h.run(_make_request(managed_doc_kind="agent_rule"), _make_config(tmp_path))
+    art_dir = _make_config(tmp_path).artifact_dir / "managed_doc:agent_rule"
+    # 有效 baseline 已固化为 before.md
+    assert (art_dir / "managed_doc_before.md").read_text(encoding="utf-8") == snap.content
+    # finally 刷新 tasks.json，含失败 task_id
+    import json as _json
+
+    ledger = _json.loads((art_dir / "managed_doc_tasks.json").read_text(encoding="utf-8"))
+    assert ledger["task_ids"] == ["task-failed"]
+    assert any(r["task_id"] == "task-failed" for r in ledger["doc_kind_records"])
+
+
+async def test_runner_pending_baseline_writes_observed_diagnostics_not_before(
+    tmp_path: Path,
+    make_harness: Callable[[], SimpleNamespace],
+) -> None:
+    """baseline 校验失败（pending_apply）：写 observed + diagnostics，不生成误导性 before。"""
+    from evo_agent.errors import ManagedDocBaselineError
+
+    snap = _make_valid_snapshot(pending_apply=True)
+    h = _md_harness_with_snapshot(make_harness, snap)
+    with pytest.raises(ManagedDocBaselineError):
+        await h.run(_make_request(managed_doc_kind="agent_rule"), _make_config(tmp_path))
+    art_dir = _make_config(tmp_path).artifact_dir / "managed_doc:agent_rule"
+    assert (art_dir / "managed_doc_observed.md").exists()
+    diag_path = art_dir / "managed_doc_diagnostics.json"
+    assert diag_path.exists()
+    import json as _json
+
+    diag = _json.loads(diag_path.read_text(encoding="utf-8"))
+    assert diag["pending_apply"] is True
+    assert diag["doc_kind"] == "agent_rule"
+    assert "content_hash" in diag and "content_length" in diag
+    # 不生成误导性的 before
+    assert not (art_dir / "managed_doc_before.md").exists()
+
+
+async def test_runner_diagnostic_failure_does_not_mask_fatal_apply_error(
+    tmp_path: Path,
+    make_harness: Callable[[], SimpleNamespace],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """finally 中 tasks.json 写盘失败（OSError）只追加 suppressed diagnostic，不覆盖原始 fatal。"""
+    import evo_agent.optimizer_runner as runner_mod
+    from evo_agent.errors import ManagedDocApplyError
+
+    snap = _make_valid_snapshot()
+    h = _md_harness_with_snapshot(make_harness, snap)
+    h.md_op.applier.records = (_md_record(task_id="task-failed"),)
+    h.trainer_cls.return_value.train.side_effect = ManagedDocApplyError(
+        agent_name="test_agent",
+        doc_kind="agent_rule",
+        task_id="task-failed",
+        phase="failed_poll",
+        adapter_error="adapter task failed",
+    )
+    orig_write = runner_mod._write_atomic_text
+
+    def failing_write(path: Path, content: str) -> None:
+        # tasks.json 写盘失败（模拟磁盘故障）；其他 artifact 正常写
+        if path.name == "managed_doc_tasks.json":
+            raise OSError("disk full")
+        return orig_write(path, content)
+
+    monkeypatch.setattr(runner_mod, "_write_atomic_text", failing_write)
+    # 原始 ManagedDocApplyError 必须穿透（不被 OSError 覆盖）
+    with pytest.raises(ManagedDocApplyError):
+        await h.run(_make_request(managed_doc_kind="agent_rule"), _make_config(tmp_path))

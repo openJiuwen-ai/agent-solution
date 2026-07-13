@@ -125,7 +125,7 @@ class ManagedDocService:
         content: str,
     ) -> dict[str, object]:
         cfg = self._config(agent_name, doc_kind)
-        validate(content)  # InvalidDocContentError → 400, no write
+        validate(content, cfg.max_content_bytes)  # InvalidDocContentError → 400, no write
         new_sha = DocStorage.sha256(content)
         storage = self._storage(cfg)
 
@@ -173,7 +173,7 @@ class ManagedDocService:
         spawned = False
         try:
             snapshot = storage.read_snapshot()  # DocNotFoundError → 404 if absent
-            validate(snapshot)  # defensive V2 (snapshot was valid when written)
+            validate(snapshot, cfg.max_content_bytes)  # defensive V2 (snapshot was valid when written)
             new_sha = DocStorage.sha256(snapshot)
             storage.write_file_atomic(snapshot)
 

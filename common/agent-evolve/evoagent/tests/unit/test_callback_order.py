@@ -13,6 +13,7 @@ from __future__ import annotations
 import inspect
 from unittest.mock import MagicMock
 
+import pytest
 from openjiuwen.agent_evolving.trainer.progress import Callbacks
 
 from evo_agent.callbacks import ComposedCallbacks, SkillDocumentCallbacks, build_callbacks
@@ -61,3 +62,80 @@ def test_build_callbacks_no_skill_sync_param() -> None:
     """
     sig = inspect.signature(build_callbacks)
     assert "skill_sync_callback" not in sig.parameters
+
+
+# ── fatal error 穿透（spec T10）──
+
+
+class _RecordingCallbacks(Callbacks):  # type: ignore[misc]
+    """记录每个 hook 调用顺序 + 可注入异常的测试 double。"""
+
+    def __init__(self, name: str = "rec", exc: Exception | None = None) -> None:
+        self.name = name
+        self.exc = exc
+        self.calls: list[str] = []
+
+    def _maybe_raise(self, hook: str) -> None:
+        self.calls.append(hook)
+        if self.exc is not None:
+            raise self.exc
+
+    def on_train_begin(self, agent: object, progress: object, eval_info: list[object]) -> None:
+        self._maybe_raise("on_train_begin")
+
+    def on_train_end(self, agent: object, progress: object, eval_info: list[object]) -> None:
+        self._maybe_raise("on_train_end")
+
+    def on_train_epoch_begin(self, agent: object, progress: object) -> None:
+        self._maybe_raise("on_train_epoch_begin")
+
+    def on_train_epoch_end(self, agent: object, progress: object, eval_info: list[object]) -> None:
+        self._maybe_raise("on_train_epoch_end")
+
+
+def test_fatal_error_propagates_through_composed_callbacks() -> None:
+    """FatalOptimizationError 子类异常穿透 ComposedCallbacks（重新抛出，不吞）。"""
+    from evo_agent.errors import FatalOptimizationError, ManagedDocApplyError
+
+    fatal = ManagedDocApplyError(
+        agent_name="a", doc_kind="k", task_id=None, phase="post", adapter_error="boom"
+    )
+    assert isinstance(fatal, FatalOptimizationError)
+    bad = _RecordingCallbacks(name="bad", exc=fatal)
+    good = _RecordingCallbacks(name="good")
+    composed = ComposedCallbacks(bad, good)
+
+    with pytest.raises(ManagedDocApplyError):
+        composed.on_train_epoch_end(MagicMock(), MagicMock(), [])  # type: ignore[arg-type]
+    # bad 被调用，good 因 fatal 穿透未执行
+    assert bad.calls == ["on_train_epoch_end"]
+    assert good.calls == []
+
+
+def test_ordinary_exception_swallowed_and_subsequent_callback_runs() -> None:
+    """普通 callback 异常仍被吞 + log，后续 callback 继续。"""
+    bad = _RecordingCallbacks(name="bad", exc=RuntimeError("transient"))
+    good = _RecordingCallbacks(name="good")
+    composed = ComposedCallbacks(bad, good)
+
+    # 不抛出（被吞）
+    composed.on_train_epoch_end(MagicMock(), MagicMock(), [])  # type: ignore[arg-type]
+    assert bad.calls == ["on_train_epoch_end"]
+    assert good.calls == ["on_train_epoch_end"]  # 后续 callback 仍执行
+
+
+def test_composed_callbacks_does_not_import_adapter_client() -> None:
+    """ComposedCallbacks 只认 FatalOptimizationError marker，不反向依赖 adapter_client。"""
+    import ast
+    import inspect
+
+    from evo_agent.callbacks import composed_callbacks as mod
+
+    tree = ast.parse(inspect.getsource(mod))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                assert "adapter_client" not in alias.name
+        elif isinstance(node, ast.ImportFrom):
+            mod_name = node.module or ""
+            assert "adapter_client" not in mod_name

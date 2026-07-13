@@ -252,3 +252,133 @@ async def test_content_success_body_shape(tmp_path: Path) -> None:
         # file_only doc：apply_mode 与 max_task_seconds 语义
         assert data["apply_mode"] == "file_only"
         assert data["max_task_seconds"] == 0
+
+
+# ── G2/C2: update 200 no-op / 202 started + 四态轮询 + 新字段 ─────────
+
+
+class _OkStrategy:
+    """Always-succeed apply strategy for the 202 started + SUCCEEDED paths."""
+
+    async def apply(self) -> ApplyResult:
+        return ApplyResult(ok=True, down_seen=True)
+
+
+class _GatedStrategy:
+    """Blocks inside apply() until ``release`` is set, then returns a result."""
+
+    def __init__(self) -> None:
+        self.release = asyncio.Event()
+        self.result = ApplyResult(ok=True, down_seen=True)
+
+    async def apply(self) -> ApplyResult:
+        await self.release.wait()
+        return self.result
+
+
+async def test_update_same_revision_200_no_op(tmp_path: Path) -> None:
+    """C2: 同 revision 重发 → 200 {success, revision, pending_apply:false}，无 task_id。"""
+    from agent_adapter.managed_doc.storage import DocStorage
+
+    app, path = _build_app(tmp_path, strategy_factory=lambda cfg: _OkStrategy())
+    storage = DocStorage(kind="agent_rule", path=str(path), allow_root=path.parent)
+    storage.write_meta(revision=DocStorage.sha256(RULE_V2))
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            "/api/v1/managed-docs",
+            json={
+                "agent_name": "edp",
+                "doc_kind": "agent_rule",
+                "action": "update",
+                "content": RULE_V2,
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["success"] is True
+        assert body["revision"] == DocStorage.sha256(RULE_V2)
+        assert body["pending_apply"] is False
+        assert "task_id" not in body
+
+
+async def test_update_new_revision_202_started_pending(tmp_path: Path) -> None:
+    """C2: 新 revision → 202 + task_id，响应体携带 PENDING（PENDING 态可观测）。"""
+    app, _ = _build_app(tmp_path, strategy_factory=lambda cfg: _GatedStrategy())
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            "/api/v1/managed-docs",
+            json={
+                "agent_name": "edp",
+                "doc_kind": "agent_rule",
+                "action": "update",
+                "content": RULE_V2,
+            },
+        )
+        assert resp.status_code == 202, resp.text
+        body = resp.json()
+        assert body["status"] == "PENDING"
+        assert "task_id" in body
+        assert body["doc_kind"] == "agent_rule"
+
+
+async def test_task_polling_running_then_succeeded(tmp_path: Path) -> None:
+    """C3: 轮询可观测 RUNNING（gated 阻塞）→ SUCCEEDED（释放后）。"""
+    from agent_adapter.managed_doc.storage import DocStorage
+
+    gated = _GatedStrategy()
+    app, _ = _build_app(tmp_path, strategy_factory=lambda cfg: gated)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            "/api/v1/managed-docs",
+            json={
+                "agent_name": "edp",
+                "doc_kind": "agent_rule",
+                "action": "update",
+                "content": RULE_V2,
+            },
+        )
+        task_id = resp.json()["task_id"]
+
+        # 任务在 gated.apply 阻塞 → 处于 RUNNING（spawned task 需让事件循环调度，
+        # 带退避重试直到脱离 PENDING）
+        poll: object = None
+        for _ in range(100):
+            poll = await client.get(f"/api/v1/managed-docs/tasks/{task_id}")
+            if poll.json()["status"] != "PENDING":  # type: ignore[union-attr]
+                break
+            await asyncio.sleep(0.01)
+        assert poll is not None
+        assert poll.json()["status"] == "RUNNING"  # type: ignore[union-attr]
+
+        # 释放后 → SUCCEEDED
+        gated.release.set()
+        await app.state.managed_doc_service.join_apply(task_id)
+        done = await client.get(f"/api/v1/managed-docs/tasks/{task_id}")
+        body = done.json()
+        assert body["status"] == "SUCCEEDED"
+        assert body["revision"] == DocStorage.sha256(RULE_V2)
+        assert body["pending_apply"] is False
+
+
+async def test_task_polling_failed_carries_last_error(tmp_path: Path) -> None:
+    """C3/C9: FAILED 携 last_error + pending_apply:true（默认 _AlwaysFail 策略）。"""
+    app, _ = _build_app(tmp_path)  # default _AlwaysFail
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            "/api/v1/managed-docs",
+            json={
+                "agent_name": "edp",
+                "doc_kind": "agent_rule",
+                "action": "update",
+                "content": RULE_V2,
+            },
+        )
+        task_id = resp.json()["task_id"]
+        await app.state.managed_doc_service.join_apply(task_id)
+
+        poll = await client.get(f"/api/v1/managed-docs/tasks/{task_id}")
+        body = poll.json()
+        assert body["status"] == "FAILED"
+        assert body["last_error"] == "boom"
+        assert body["pending_apply"] is True

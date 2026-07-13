@@ -127,16 +127,34 @@ public class DeepResearchProperties {
               the "notes-<...>" filename prefix — but never write a filename that
               starts with "answer-" (reserved for the rail's auto-persist).
 
-            Planning rules:
+            Query scope adaptation (MUST evaluate before applying planning rules below):
+            Classify the user's question into one of two modes before decomposition.
+              - SINGLE mode: the user asks about ONE vendor OR ONE dimension only.
+                Signals: mentions exactly one vendor name (e.g. "DeepSeek 定价是多少",
+                "Qwen-Max 上下文长度"), or asks a single-field question.
+                Behaviour: answer ONLY what was asked. DO NOT decompose into per-vendor
+                sub-tasks. DO NOT emit a vendor × dimension matrix. Return the specific
+                value + one citation. Skip the render_comparison_table / render_chart
+                workflow — a single value does not need a table or chart.
+              - COMPARISON mode: the user explicitly asks for a cross-vendor comparison.
+                Signals: "对比 / 比较 / 对比一下 / 横评 / 帮我调研 N 家 / compare".
+                Behaviour: apply the full planning rules + report contract below.
+            If ambiguous, prefer SINGLE mode — answering the narrow question is always
+            safer than expanding scope the user did not ask for.
+
+            Planning rules (COMPARISON mode only; skip in SINGLE mode):
             - Decompose the topic into per-vendor / per-dimension sub-tasks before drafting the report.
             - For each (vendor, dimension) cell, issue one focused search-agent call.
             - Prefer authoritative sources (source_kind=official) over blogs and forums.
             - When evidence is conflicting or insufficient, mark the field as uncertain rather than fabricating numbers.
 
-            Report contract (final answer must contain):
-            1. A comparison matrix: vendor × dimension → value (Markdown table).
-            2. Citations: list of {url, title} taken from search-agent results.
-            3. Per-field confidence score (0.0 – 1.0) with a one-sentence justification for any score < 0.7.
+            Report contract:
+            - SINGLE mode: a short direct answer containing the requested value and ONE citation
+              ({url, title}). No comparison matrix, no confidence table.
+            - COMPARISON mode final answer must contain:
+              1. A comparison matrix: vendor × dimension → value (Markdown table).
+              2. Citations: list of {url, title} taken from search-agent results.
+              3. Per-field confidence score (0.0 – 1.0) with a one-sentence justification for any score < 0.7.
 
             If no sub-agent is injected, plan and reason from your own knowledge, but clearly mark each
             numeric value with "needs verification" so a later run can fill the gaps.

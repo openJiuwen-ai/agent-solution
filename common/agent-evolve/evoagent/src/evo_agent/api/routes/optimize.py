@@ -60,6 +60,10 @@ class OptimizeAPIRequest(BaseModel):
     evaluator_template: EvaluatorTemplateRequest
     skills: list[str] = Field(default_factory=list)
     dataset_path: str
+    # managed-doc 单文档优化模式（spec F3）：精确 doc_kind，与 skills 互斥（XOR）。
+    # adapter ManagedDocRegistry 按配置值精确匹配，故只 strip 不小写化；空白视为
+    # 未提供（None）。使用该参数时走 F7 builder 分支，skills 必须为空。
+    managed_doc_kind: str | None = None
 
     @field_validator("dataset_path")
     @classmethod
@@ -137,23 +141,30 @@ def _normalize(api_req: OptimizeAPIRequest, config: EvolveConfig) -> InternalOpt
     )
 
     eval_prompt = api_req.evaluator_template.prompt
-    stripped = eval_prompt.strip()
+    stripped_prompt = eval_prompt.strip()
     logger.debug(
         "evaluator_prompt: len=%s stripped_len=%s "
         "markers: strict=%s compliance=%s weighted=%s safety=%s",
         len(eval_prompt),
-        len(stripped),
-        "严格评估" in stripped,
-        "compliance" in stripped,
-        "× 0.5" in stripped,
-        "safety" in stripped,
+        len(stripped_prompt),
+        "严格评估" in stripped_prompt,
+        "compliance" in stripped_prompt,
+        "× 0.5" in stripped_prompt,
+        "safety" in stripped_prompt,
     )
+
+    # managed_doc_kind：strip + 空白→None（不小写化，adapter 精确匹配）。
+    # XOR 由路由层 _validate_xor 双保险收口（both-present / both-absent 均拒绝）；
+    # 此处仅做归一：managed-doc 模式下 skills 强制为空（走 F7 builder 分支）。
+    managed_doc_kind_raw = api_req.managed_doc_kind
+    managed_doc_kind = managed_doc_kind_raw.strip() if managed_doc_kind_raw else None
+    skills = [] if managed_doc_kind is not None else list(api_req.skills)
 
     return InternalOptimizeRequest(
         scenario=tpl.scenario or tpl.name,
         agent_name=api_req.agent_name,
         optimizer_type=api_req.optimizer_type,
-        skills=api_req.skills,
+        skills=skills,
         dataset_path=api_req.dataset_path,
         dataset_manifest_path=None,
         evaluator_prompt=api_req.evaluator_template.prompt,
@@ -165,6 +176,7 @@ def _normalize(api_req: OptimizeAPIRequest, config: EvolveConfig) -> InternalOpt
         train_split=tpl.train_split,
         val_split=tpl.val_split,
         task_name=api_req.task_name,
+        managed_doc_kind=managed_doc_kind,
     )
 
 
@@ -218,6 +230,24 @@ async def start_optimize(api_request: OptimizeAPIRequest) -> JobResponse:
     except (FileNotFoundError, ValueError):
         pass  # _normalize 会 fallback 到默认场景
 
+    # XOR 双保险（spec F3）：skills 与 managed_doc_kind 互斥，且必须提供其一。
+    # 叶子 dataclass 仅拒绝 both-present（保留 runner eval-only 空路径），入口层
+    # 收口 both-absent（API 无目标即拒绝，422）。strip 后空白视为未提供。
+    md_kind_raw = api_request.managed_doc_kind
+    md_kind = md_kind_raw.strip() if md_kind_raw else None
+    has_skills = bool(api_request.skills)
+    has_managed_doc = md_kind is not None
+    if has_skills and has_managed_doc:
+        raise HTTPException(
+            status_code=422,
+            detail="skills 与 managed_doc_kind 互斥：请只提供一种优化目标。",
+        )
+    if not has_skills and not has_managed_doc:
+        raise HTTPException(
+            status_code=422,
+            detail="必须提供 skills 或 managed_doc_kind 之一。",
+        )
+
     # 归一化为内部请求格式（在 submit 之前，避免失败时产生僵尸 Job）
     try:
         internal_request = _normalize(api_request, config)
@@ -225,6 +255,9 @@ async def start_optimize(api_request: OptimizeAPIRequest) -> JobResponse:
         raise HTTPException(status_code=422, detail=str(e)) from e
 
     job = job_manager.submit(api_request.model_dump())
+    # 保存归一化 managed_doc_kind 作 Job metadata，供 cancel 路由判断模式
+    # （RUNNING managed-doc job 禁止伪取消，cooperative cancellation 属 ADR Deferred）。
+    job.managed_doc_kind = internal_request.managed_doc_kind
 
     # 在后台启动优化任务
     progress_callback = ProgressCallback(job)
@@ -298,6 +331,12 @@ async def start_optimize(api_request: OptimizeAPIRequest) -> JobResponse:
                     }
                     for sc in report.skill_contents
                 ],
+                # managed-doc 单文档优化回填字段（spec F1/F3）：job 完成后填充，
+                # managed-doc 模式才有值；Skill 模式四字段为 None/[]。
+                "managed_doc_kind": report.managed_doc_kind,
+                "managed_doc_content_before": report.managed_doc_content_before,
+                "managed_doc_content_after": report.managed_doc_content_after,
+                "managed_doc_task_ids": list(report.managed_doc_task_ids),
             }
             # COMPLETED 仅在训练 + 报告格式化均成功后设置，
             # 避免 on_train_end 提前设 COMPLETED 而 format() 失败导致状态闪烁。
@@ -388,6 +427,19 @@ async def cancel_job(job_id: str) -> JobResponse:
     job = job_manager.get(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
+
+    # managed-doc RUNNING job 禁止伪取消（spec F3 / 不变量 1）：apply 生效前不能
+    # 停止后台写文档/restart，否则调用者看到终态但 remote 仍可能继续写。
+    # cooperative cancellation 属 ADR Deferred。QUEUED 阶段（训练未开始）仍可取消。
+    if job.managed_doc_kind is not None and job.status == JobStatus.RUNNING:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "managed-doc running job cannot be cancelled "
+                "(cooperative cancellation not supported; "
+                "cancel before RUNNING or wait for completion)"
+            ),
+        )
 
     if not job_manager.cancel(job_id):
         raise HTTPException(

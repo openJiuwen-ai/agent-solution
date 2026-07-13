@@ -427,3 +427,154 @@ def test_resource_resolver_is_protocol() -> None:
     assert hasattr(ResourceResolver, "__protocol_attrs__") or issubclass(
         type(ResourceResolver), type(Protocol)
     )
+
+
+# ── managed-doc API（spec F3）──
+
+
+def _make_managed_doc_api_request(
+    *, tmp_path: Path, scenario_name: str = "edp_agent"
+) -> dict:
+    """构造 managed-doc 请求：managed_doc_kind + skills=[]（走 F7 builder 分支）。"""
+    data_file = tmp_path / "items.json"
+    data_file.write_text("[]", encoding="utf-8")
+    return {
+        "task_name": "test-task",
+        "agent_name": "test_agent",
+        "optimizer_type": "skill",
+        "dataset_path": str(data_file),
+        "skills": [],
+        "managed_doc_kind": "agent_rule",
+        "optimizer_template": {
+            "name": scenario_name,
+            "scenario": scenario_name,
+            "hyperparams": {},
+            "train_split": 0.8,
+            "val_split": 0.2,
+        },
+        "evaluator_template": {
+            "name": "default_eval",
+            "scenario": "金融客服",
+            "prompt": "评估回答质量",
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_start_optimize_rejects_skills_and_managed_doc_kind_both_present(
+    client: AsyncClient, tmp_path: Path, config_with_adapter: EvolveConfig
+) -> None:
+    """路由层 XOR 双保险：skills + managed_doc_kind 同时存在 → 422。"""
+    body = _make_api_request(tmp_path=tmp_path)
+    body["managed_doc_kind"] = "agent_rule"  # 同时给 skills=["skill_a"]
+    with patch(
+        "evo_agent.api.routes.optimize.EvolveConfig.get",
+        return_value=config_with_adapter,
+    ):
+        resp = await client.post("/optimize", json=body)
+    assert resp.status_code == 422
+    assert "互斥" in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_start_optimize_rejects_both_skills_and_managed_doc_kind_absent(
+    client: AsyncClient, tmp_path: Path, config_with_adapter: EvolveConfig
+) -> None:
+    """入口层收口无目标：skills + managed_doc_kind 同时缺失 → 422。"""
+    body = _make_api_request(tmp_path=tmp_path)
+    body["skills"] = []  # 无 managed_doc_kind + 空 skills
+    with patch(
+        "evo_agent.api.routes.optimize.EvolveConfig.get",
+        return_value=config_with_adapter,
+    ):
+        resp = await client.post("/optimize", json=body)
+    assert resp.status_code == 422
+    assert "必须提供" in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_start_optimize_managed_doc_response_includes_before_after_task_ids(
+    client: AsyncClient, tmp_path: Path, config_with_adapter: EvolveConfig
+) -> None:
+    """managed-doc job 完成后 response 含 before/after/task_ids 四字段。"""
+    md_report = OptimizeReport(
+        skills=("managed_doc:agent_rule",),
+        dataset="agent_rule_dataset",
+        epochs_completed=1,
+        edits_applied=0,
+        train=TrainResult(
+            score_before=0.4,
+            score_after=0.5,
+            improvement="+25%",
+            pass_rate_before=0.4,
+            pass_rate_after=0.5,
+            num_cases=1,
+        ),
+        val=ValResult(
+            score_before=0.4,
+            final_score=0.5,
+            best_score=0.5,
+            per_epoch_scores=(0.5,),
+            num_cases=1,
+        ),
+        gate_results=(),
+        artifact_dir=tmp_path,
+        managed_doc_kind="agent_rule",
+        managed_doc_content_before="# rule v1",
+        managed_doc_content_after="# rule v2",
+        managed_doc_task_ids=("task-1", "task-2"),
+    )
+    body = _make_managed_doc_api_request(tmp_path=tmp_path)
+    with (
+        patch(
+            "evo_agent.api.routes.optimize.EvolveConfig.get",
+            return_value=config_with_adapter,
+        ),
+        patch(
+            "evo_agent.api.routes.optimize.run_optimization",
+            new=AsyncMock(return_value=md_report),
+        ),
+    ):
+        resp = await client.post("/optimize", json=body)
+    assert resp.status_code == 200
+    job_id = resp.json()["job_id"]
+    job = job_manager.get(job_id)
+    assert job is not None
+    assert job.managed_doc_kind == "agent_rule"
+    assert job.background_task is not None
+    await job.background_task
+    assert job.status == JobStatus.COMPLETED
+    assert job.result is not None
+    assert job.result["managed_doc_kind"] == "agent_rule"
+    assert job.result["managed_doc_content_before"] == "# rule v1"
+    assert job.result["managed_doc_content_after"] == "# rule v2"
+    assert job.result["managed_doc_task_ids"] == ["task-1", "task-2"]
+
+
+@pytest.mark.asyncio
+async def test_running_managed_doc_cancel_returns_409_and_keeps_running(
+    client: AsyncClient,
+) -> None:
+    """RUNNING managed-doc job 禁止伪取消（不变量 1）：409 且 status 仍 RUNNING。"""
+
+    job = job_manager.submit({"task_name": "md-cancel-test"})
+    job.managed_doc_kind = "agent_rule"
+    job.status = JobStatus.RUNNING
+    resp = await client.post(f"/optimize/{job.job_id}/cancel")
+    assert resp.status_code == 409
+    assert "managed-doc running job" in resp.json()["detail"]
+    # job 仍 RUNNING，未被标 CANCELLED
+    assert job_manager.get(job.job_id).status == JobStatus.RUNNING
+
+
+@pytest.mark.asyncio
+async def test_queued_managed_doc_job_can_be_cancelled(client: AsyncClient) -> None:
+    """QUEUED 阶段（训练未开始）managed-doc job 仍可取消 → 200 + CANCELLED。"""
+
+    job = job_manager.submit({"task_name": "md-queued-cancel-test"})
+    job.managed_doc_kind = "agent_rule"
+    # 保持 QUEUED（submit 默认状态）
+    assert job.status == JobStatus.QUEUED
+    resp = await client.post(f"/optimize/{job.job_id}/cancel")
+    assert resp.status_code == 200
+    assert job_manager.get(job.job_id).status == JobStatus.CANCELLED

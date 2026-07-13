@@ -66,6 +66,10 @@ class Job:
     event_buffer: deque[SSEEvent] = field(
         default_factory=lambda: deque(maxlen=_EVENT_BUFFER_MAXLEN)
     )
+    # managed-doc 模式标记（spec F3）：归一化后的 managed_doc_kind，None = Skill 模式。
+    # 供 cancel 路由判断：RUNNING managed-doc job 禁止伪取消（cooperative cancellation
+    # 属 ADR Deferred），QUEUED 阶段仍可取消。
+    managed_doc_kind: str | None = None
     _next_event_id: int = field(default=0, init=False, repr=False)
     background_task: asyncio.Task[None] | None = field(default=None, init=False, repr=False)
 

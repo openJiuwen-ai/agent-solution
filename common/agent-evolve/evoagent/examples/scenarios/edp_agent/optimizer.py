@@ -602,9 +602,23 @@ class EDPAgentOptimizer(DictSkillDocumentOptimizer):
         改用项目的 load_prompt()，优先加载场景级 prompt 覆盖。
 
         ``slim=True`` 时省略 step_buffer / meta_skill，用作超时重试精简 prompt（B4）。
+
+        managed-doc 模式（spec F10）：当唯一 target id 以 ``managed_doc:`` 开头时，
+        加入 agent-rule 语义段并把 ``Current Skill`` 标题改为 ``Current Agent Rule
+        Document``。``_llm_merge_edits`` / ``meta_skill`` 仍用基类 Skill 措辞，不改。
         """
         system = load_prompt(template_name, self._SCENARIO_NAME)
-        user = f"## Current Skill\n{skill_content}\n\n"
+        is_managed_doc = self._is_managed_doc_target()
+        user = ""
+        if is_managed_doc:
+            user += (
+                "Target type: agent runtime rule document\n"
+                "Scope: applies globally to every conversation\n"
+                "Constraints: preserve identity, safety, tool-policy "
+                "and mandatory business rules\n\n"
+            )
+        title = "Current Agent Rule Document" if is_managed_doc else "Current Skill"
+        user += f"## {title}\n{skill_content}\n\n"
         user += f"## Edits Budget\nProduce at most L={self._scheduler.max_lr} edits.\n\n"
         if not slim and step_buffer_context.strip():
             user += f"## Previous Steps in This Epoch\n{step_buffer_context}\n\n"
@@ -617,6 +631,16 @@ class EDPAgentOptimizer(DictSkillDocumentOptimizer):
             user += f"## Successful Trajectories\n{trajectories_text}"
 
         return f"{system}\n\n{user}"
+
+    def _is_managed_doc_target(self) -> bool:
+        """唯一 target id 以 ``managed_doc:`` 开头 → managed-doc 单文档优化模式。
+
+        单 operator short-circuit 下，sole operator id 即 canonical id
+        ``managed_doc:{kind}``；多 operator 永远不是 managed-doc 模式（本期不支持
+        混合优化）。
+        """
+        op_ids = list(self._operators.keys())
+        return len(op_ids) == 1 and op_ids[0].startswith("managed_doc:")
 
     # ── Rollout ─────────────────────────────────────────────────────────
 

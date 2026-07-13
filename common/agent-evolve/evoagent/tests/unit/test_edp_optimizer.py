@@ -2381,3 +2381,100 @@ async def test_select_override_pushes_select_event() -> None:
 
     phases = [d.get("phase") for _, d in events if _ == "log"]
     assert "select" in phases
+
+
+# ── managed-doc analyst prompt（spec F10）──
+
+
+@pytest.fixture
+def real_edp_cls() -> Any:
+    """动态加载真实 scenarios/edp_agent/optimizer.py 的 EDPAgentOptimizer 类。
+
+    edp_cls fixture 加载的是 _OPTIMIZER_CODE 副本，无法覆盖对真实 optimizer 文件
+    的改动；F10 直接验证真实 _build_analyst_prompt 实现。
+    """
+    import importlib.util
+
+    path = Path("scenarios/edp_agent/optimizer.py").resolve()
+    spec = importlib.util.spec_from_file_location("_real_edp_opt", path)
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["_real_edp_opt"] = mod
+    spec.loader.exec_module(mod)
+    yield mod.EDPAgentOptimizer
+    sys.modules.pop("_real_edp_opt", None)
+
+
+def _make_prompt_optimizer(
+    cls: type,
+    *,
+    operators: dict[str, Any],
+) -> Any:
+    """构造只够跑 _build_analyst_prompt 的 optimizer 实例（__new__ + 注入）。"""
+    opt = cls.__new__(cls)
+    opt._SCENARIO_NAME = "edp_agent"
+    opt._operators = operators
+    opt._scheduler = MagicMock()
+    opt._scheduler.max_lr = 5
+    return opt
+
+
+def test_analyst_prompt_includes_agent_rule_semantics_when_managed_doc_target(
+    real_edp_cls: type,
+) -> None:
+    """managed-doc 模式 analyst prompt 含 agent-rule 语义段。"""
+    with patch.object(sys.modules[real_edp_cls.__module__], "load_prompt", return_value="SYSTEM"):
+        opt = _make_prompt_optimizer(
+            real_edp_cls,
+            operators={"managed_doc:agent_rule": MagicMock()},
+        )
+        prompt = opt._build_analyst_prompt(
+            "reflect",
+            "# rule content",
+            "trajectories text",
+            "",
+            "",
+        )
+    assert "Target type: agent runtime rule document" in prompt
+    assert "Scope: applies globally to every conversation" in prompt
+    assert (
+        "Constraints: preserve identity, safety, tool-policy and mandatory business rules"
+        in prompt
+    )
+    # 标题切换
+    assert "## Current Agent Rule Document" in prompt
+    assert "## Current Skill" not in prompt
+    # 内容仍注入
+    assert "# rule content" in prompt
+
+
+def test_analyst_prompt_title_changes_to_current_agent_rule_document(
+    real_edp_cls: type,
+) -> None:
+    """managed-doc 模式标题改为 Current Agent Rule Document。"""
+    with patch.object(sys.modules[real_edp_cls.__module__], "load_prompt", return_value="SYSTEM"):
+        opt = _make_prompt_optimizer(
+            real_edp_cls,
+            operators={"managed_doc:agent_rule": MagicMock()},
+        )
+        prompt = opt._build_analyst_prompt("reflect", "x", "t", "", "")
+    assert "## Current Agent Rule Document\nx" in prompt
+
+
+def test_analyst_prompt_unchanged_for_skill_target(real_edp_cls: type) -> None:
+    """Skill 模式 prompt 不变：标题 Current Skill，无 agent-rule 语义段。"""
+    with patch.object(sys.modules[real_edp_cls.__module__], "load_prompt", return_value="SYSTEM"):
+        opt = _make_prompt_optimizer(
+            real_edp_cls,
+            operators={"product_recommend_skill": MagicMock()},
+        )
+        prompt = opt._build_analyst_prompt(
+            "reflect",
+            "# skill content",
+            "trajectories text",
+            "",
+            "",
+        )
+    assert "## Current Skill\n# skill content" in prompt
+    assert "## Current Agent Rule Document" not in prompt
+    assert "Target type: agent runtime rule document" not in prompt

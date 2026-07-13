@@ -17,7 +17,7 @@ is ``doc`` (explicit) > ``defaults`` (explicit) > profile base (§8.4 table).
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 from agent_adapter.config import (
     AdapterConfig,
@@ -146,9 +146,48 @@ class ManagedDocRegistry:
         fields["health_url"] = health_url
 
         try:
-            return ManagedDocConfig(**fields)
+            resolved = ManagedDocConfig(**fields)
         except ValueError as exc:
             # apply=restart but restart_cmd unresolved → validator 触发
             raise ManagedDocRegistryError(
                 f"restart doc '{doc.kind}' for agent '{agent.name}': {exc}"
             ) from exc
+        _validate_restart_finite(resolved, doc.kind, agent.name)
+        return resolved
+
+
+def _validate_restart_finite(
+    cfg: ManagedDocConfig, kind: str, agent_name: str
+) -> None:
+    """G2.1: post-resolve finite 校验。
+
+    所有 restart 时间/重试字段必须 finite 且合法；任一非法 →
+    ``ManagedDocRegistryError``（启动期失败，符合 spec「构建期校验」语义）。
+    profile 背书的字段在 resolve 后必非 None；restart_timeout 无 profile
+    基线，未显式提供则为 None → 拒绝（C11：deploy 契约要求 > 0）。
+    """
+
+    def _fail(msg: str) -> NoReturn:
+        raise ManagedDocRegistryError(
+            f"restart doc '{kind}' for agent '{agent_name}': {msg}"
+        )
+
+    if cfg.restart_timeout is None or cfg.restart_timeout <= 0:
+        _fail(f"restart_timeout must be > 0 (got {cfg.restart_timeout!r})")
+    if cfg.max_attempts is None or cfg.max_attempts < 1:
+        _fail(f"max_attempts must be >= 1 (got {cfg.max_attempts!r})")
+    if cfg.health_down_timeout is None or cfg.health_down_timeout < 0:
+        _fail(f"health_down_timeout must be >= 0 (got {cfg.health_down_timeout!r})")
+    if cfg.health_up_timeout is None or cfg.health_up_timeout <= 0:
+        _fail(f"health_up_timeout must be > 0 (got {cfg.health_up_timeout!r})")
+    if cfg.health_poll_interval is None or cfg.health_poll_interval <= 0:
+        _fail(f"health_poll_interval must be > 0 (got {cfg.health_poll_interval!r})")
+    if cfg.health_up_consecutive is None or cfg.health_up_consecutive < 1:
+        _fail(f"health_up_consecutive must be >= 1 (got {cfg.health_up_consecutive!r})")
+    if cfg.backoff_base is None or cfg.backoff_base < 0:
+        _fail(f"backoff_base must be >= 0 (got {cfg.backoff_base!r})")
+    if cfg.backoff_max is None or cfg.backoff_max < cfg.backoff_base:
+        _fail(
+            "backoff_max must be >= backoff_base "
+            f"(got backoff_max={cfg.backoff_max!r}, backoff_base={cfg.backoff_base!r})"
+        )

@@ -65,6 +65,7 @@ def test_restart_without_agent_url_and_health_url_raises() -> None:
         path="/x",
         apply="restart",
         restart_cmd="docker restart edp",
+        restart_timeout=30,
         health_url="http://localhost:9999/health",  # 显式给 → 不应报错
     )
     # 无 agent_url 但有显式 health_url → OK
@@ -97,6 +98,7 @@ def test_restart_health_url_derived_from_agent_url() -> None:
         path="/x",
         apply="restart",
         restart_cmd="docker restart edp",
+        restart_timeout=30,
     )
     reg = ManagedDocRegistry(
         agents=[_agent(agent_url="http://localhost:8090", docs=[doc])],
@@ -111,6 +113,7 @@ def test_restart_explicit_health_url_beats_agent_url() -> None:
         path="/x",
         apply="restart",
         restart_cmd="docker restart edp",
+        restart_timeout=30,
         health_url="http://explicit/health",
     )
     reg = ManagedDocRegistry(
@@ -129,6 +132,7 @@ def test_agent_missing_project_id_agent_id_still_registers_restart() -> None:
         path="/x",
         apply="restart",
         restart_cmd="docker restart edp",
+        restart_timeout=30,
     )
     # agent_url 有（可派生 health_url），但 project_id/agent_id 缺失 → 仍注册
     reg = ManagedDocRegistry(
@@ -156,6 +160,7 @@ def test_burst_profile_defaults_applied_to_none_fields() -> None:
         path="/x",
         apply="restart",
         restart_cmd="docker restart edp",
+        restart_timeout=30,
     )
     reg = ManagedDocRegistry(
         agents=[_agent(agent_url="http://localhost:8090", docs=[doc])],
@@ -173,6 +178,7 @@ def test_single_profile_defaults_applied() -> None:
         path="/x",
         apply="restart",
         restart_cmd="docker restart edp",
+        restart_timeout=30,
     )
     reg = ManagedDocRegistry(
         agents=[_agent(agent_url="http://localhost:8090", docs=[doc])],
@@ -189,6 +195,7 @@ def test_explicit_doc_override_beats_defaults() -> None:
         path="/x",
         apply="restart",
         restart_cmd="docker restart edp",
+        restart_timeout=30,
         max_attempts=7,
     )
     reg = ManagedDocRegistry(
@@ -219,7 +226,8 @@ def test_from_config_builds_registry(tmp_path) -> None:
         "      - kind: agent_rule\n"
         "        path: /host/edp/AgentRule.md\n"
         "        apply: restart\n"
-        "        restart_cmd: docker restart edp\n",
+        "        restart_cmd: docker restart edp\n"
+        "        restart_timeout: 30\n",
         encoding="utf-8",
     )
     config = load_config(yaml_path)
@@ -238,6 +246,7 @@ def test_restart_resolve_passes_explicit_max_content_bytes() -> None:
         path="/x",
         apply="restart",
         restart_cmd="docker restart edp",
+        restart_timeout=30,
         health_url="http://localhost:9999/health",
         max_content_bytes=4096,
     )
@@ -252,6 +261,7 @@ def test_restart_resolve_defaults_max_content_bytes_256k() -> None:
         path="/x",
         apply="restart",
         restart_cmd="docker restart edp",
+        restart_timeout=30,
         health_url="http://localhost:9999/health",
     )
     reg = ManagedDocRegistry(agents=[_agent(docs=[doc])], defaults=ManagedDocDefaults())
@@ -266,3 +276,124 @@ def test_file_only_resolve_passes_explicit_max_content_bytes() -> None:
     reg = ManagedDocRegistry(agents=[_agent(docs=[doc])], defaults=ManagedDocDefaults())
     got = reg.get("edp", "agent_rule")
     assert got.max_content_bytes == 512
+
+
+# ── AC G2.1: restart kind post-resolve finite 校验 ────────────────────
+
+
+def _restart_doc(**overrides) -> ManagedDocConfig:
+    """合法 restart doc 基线（含显式 restart_timeout）；覆盖单项以测非法值。"""
+    base: dict[str, object] = dict(
+        kind="agent_rule",
+        path="/x",
+        apply="restart",
+        restart_cmd="docker restart edp",
+        health_url="http://localhost:9999/health",
+        restart_timeout=30,
+    )
+    base.update(overrides)
+    return ManagedDocConfig(**base)  # type: ignore[arg-type]
+
+
+def test_restart_defaults_pass_finite_check_burst() -> None:
+    """burst profile 默认值 + 显式 restart_timeout → 通过 finite 校验。"""
+    doc = _restart_doc()
+    reg = ManagedDocRegistry(
+        agents=[_agent(docs=[doc])], defaults=ManagedDocDefaults(profile="burst")
+    )
+    got = reg.get("edp", "agent_rule")
+    assert got.max_attempts == 2
+
+
+def test_restart_defaults_pass_finite_check_single() -> None:
+    doc = _restart_doc()
+    reg = ManagedDocRegistry(
+        agents=[_agent(docs=[doc])], defaults=ManagedDocDefaults(profile="single")
+    )
+    reg.get("edp", "agent_rule")  # 不抛即通过
+
+
+def test_restart_missing_restart_timeout_rejected() -> None:
+    """restart_timeout None（未显式提供）→ ManagedDocRegistryError。"""
+    doc = ManagedDocConfig(
+        kind="agent_rule",
+        path="/x",
+        apply="restart",
+        restart_cmd="docker restart edp",
+        health_url="http://localhost:9999/health",
+    )
+    with pytest.raises(ManagedDocRegistryError):
+        ManagedDocRegistry(agents=[_agent(docs=[doc])], defaults=ManagedDocDefaults())
+
+
+def test_restart_zero_restart_timeout_rejected() -> None:
+    with pytest.raises(ManagedDocRegistryError):
+        ManagedDocRegistry(
+            agents=[_agent(docs=[_restart_doc(restart_timeout=0)])],
+            defaults=ManagedDocDefaults(),
+        )
+
+
+def test_restart_zero_max_attempts_rejected() -> None:
+    with pytest.raises(ManagedDocRegistryError):
+        ManagedDocRegistry(
+            agents=[_agent(docs=[_restart_doc(max_attempts=0)])],
+            defaults=ManagedDocDefaults(),
+        )
+
+
+def test_restart_negative_health_down_timeout_rejected() -> None:
+    with pytest.raises(ManagedDocRegistryError):
+        ManagedDocRegistry(
+            agents=[_agent(docs=[_restart_doc(health_down_timeout=-1)])],
+            defaults=ManagedDocDefaults(),
+        )
+
+
+def test_restart_zero_health_up_timeout_rejected() -> None:
+    with pytest.raises(ManagedDocRegistryError):
+        ManagedDocRegistry(
+            agents=[_agent(docs=[_restart_doc(health_up_timeout=0)])],
+            defaults=ManagedDocDefaults(),
+        )
+
+
+def test_restart_zero_health_poll_interval_rejected() -> None:
+    with pytest.raises(ManagedDocRegistryError):
+        ManagedDocRegistry(
+            agents=[_agent(docs=[_restart_doc(health_poll_interval=0)])],
+            defaults=ManagedDocDefaults(),
+        )
+
+
+def test_restart_zero_health_up_consecutive_rejected() -> None:
+    with pytest.raises(ManagedDocRegistryError):
+        ManagedDocRegistry(
+            agents=[_agent(docs=[_restart_doc(health_up_consecutive=0)])],
+            defaults=ManagedDocDefaults(),
+        )
+
+
+def test_restart_backoff_base_gt_max_rejected() -> None:
+    with pytest.raises(ManagedDocRegistryError):
+        ManagedDocRegistry(
+            agents=[_agent(docs=[_restart_doc(backoff_base=10.0, backoff_max=5.0)])],
+            defaults=ManagedDocDefaults(),
+        )
+
+
+def test_restart_negative_backoff_base_rejected() -> None:
+    with pytest.raises(ManagedDocRegistryError):
+        ManagedDocRegistry(
+            agents=[_agent(docs=[_restart_doc(backoff_base=-1.0)])],
+            defaults=ManagedDocDefaults(),
+        )
+
+
+def test_restart_zero_backoff_base_passes() -> None:
+    """0 <= backoff_base 允许（backoff_base=0 → 退避和 B=0）。"""
+    reg = ManagedDocRegistry(
+        agents=[_agent(docs=[_restart_doc(backoff_base=0.0)])],
+        defaults=ManagedDocDefaults(),
+    )
+    reg.get("edp", "agent_rule")

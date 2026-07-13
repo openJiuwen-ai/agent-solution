@@ -59,3 +59,41 @@ class ManagedDocApplyError(FatalOptimizationError):
             f"managed-doc apply failed: agent={agent_name} doc_kind={doc_kind} "
             f"task_id={task_id} phase={phase} adapter_error={adapter_error}"
         )
+
+
+class ManagedDocBaselineError(FatalOptimizationError):
+    """job-start baseline for a managed-doc failed — abort before any rollout.
+
+    Raised by ``optimizer_runner`` (spec F7) when the job-start snapshot does
+    not satisfy the baseline invariants: ``apply_mode != "restart"``,
+    ``pending_apply == true``, ``file_revision != applied_revision``, or the
+    configured apply deadline is below ``max_task_seconds + 10s``. No global
+    ``restore`` is called and no rollout starts — the baseline is the contract
+    that every subsequent apply is measured against, so an unconfirmed baseline
+    must abort rather than train against a diverged state.
+
+    Fields:
+        agent_name: the optimization job's agent name.
+        doc_kind: the exact managed-doc kind being baselined.
+        reason: short invariant that failed (``"pending_apply"`` /
+            ``"apply_mode"`` / ``"revision_mismatch"`` / ``"deadline"``).
+        diagnostics: human-readable snapshot + deadline diagnostics for the
+            failure artifact (no full document content).
+    """
+
+    def __init__(
+        self,
+        *,
+        agent_name: str,
+        doc_kind: str,
+        reason: str,
+        diagnostics: str,
+    ) -> None:
+        self.agent_name = agent_name
+        self.doc_kind = doc_kind
+        self.reason = reason
+        self.diagnostics = diagnostics
+        super().__init__(
+            f"managed-doc baseline failed: agent={agent_name} doc_kind={doc_kind} "
+            f"reason={reason} diagnostics={diagnostics}"
+        )

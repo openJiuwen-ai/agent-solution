@@ -28,6 +28,15 @@ class ReportFormatter:
         num_val_cases: int = 0,
         val_baseline_case_scores: list[float] | None = None,
         val_per_epoch_case_scores: list[list[float]] | None = None,
+        # managed-doc 上下文（spec F8）：runner 在成功路径把 baseline snapshot 内容
+        # （before）、operator committed 内容（after）、applier records 与非空 task_ids
+        # 传入。formatter 写 managed_doc_final.md / managed_doc_diff.patch 并回填 report
+        # 字段；失败路径的 before/tasks.json 由 runner finally 负责（不在 formatter）。
+        managed_doc_kind: str | None = None,
+        managed_doc_content_before: str | None = None,
+        managed_doc_content_after: str | None = None,
+        managed_doc_task_ids: tuple[str, ...] = (),
+        managed_doc_records: tuple[Any, ...] = (),
     ) -> None:
         self._artifact_dir = artifact_dir
         self._skills = skills
@@ -40,6 +49,11 @@ class ReportFormatter:
         # （候选 fresh eval）同序同长，按 argmax(候选分) 取 best-epoch 通过率。
         self._val_baseline_case_scores = val_baseline_case_scores or []
         self._val_per_epoch_case_scores = val_per_epoch_case_scores or []
+        self._managed_doc_kind = managed_doc_kind
+        self._managed_doc_content_before = managed_doc_content_before
+        self._managed_doc_content_after = managed_doc_content_after
+        self._managed_doc_task_ids = managed_doc_task_ids
+        self._managed_doc_records = managed_doc_records
 
     def format(self) -> OptimizeReport:
         """汇总 artifact 目录中的数据，生成 OptimizeReport。

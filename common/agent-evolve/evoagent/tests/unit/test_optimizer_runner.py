@@ -26,6 +26,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from evo_agent.adapter_client.client import AdapterClient, AdapterError
+from evo_agent.adapter_client.types import ManagedDocSnapshot
 from evo_agent.config import EvolveConfig
 from evo_agent.optimizer_runner import _build_operators, _rewrite_gate_results, run_optimization
 from evo_agent.types import OptimizeReport, OptimizeRequest, TrainResult, ValResult
@@ -39,14 +40,35 @@ def _make_request(
     adapter_url: str = "http://adapter.test",
     agent_name: str = "test_agent",
     num_epochs: int = 2,
+    managed_doc_kind: str | None = None,
 ) -> OptimizeRequest:
     return OptimizeRequest(
         scenario="edp_agent",
         dataset_manifest_path=Path("/tmp/dataset.yaml"),
         adapter_url=adapter_url,
-        skills=["skill_a"] if skills is None else skills,
+        skills=["skill_a"] if skills is None and managed_doc_kind is None else (skills or []),
         agent_name=agent_name,
         num_epochs=num_epochs,
+        managed_doc_kind=managed_doc_kind,
+    )
+
+
+def _make_valid_snapshot(
+    *,
+    content: str = "# baseline agent rule",
+    file_revision: str = "rev-1",
+    applied_revision: str | None = "rev-1",
+    pending_apply: bool = False,
+    apply_mode: str = "restart",
+    max_task_seconds: float = 60.0,
+) -> ManagedDocSnapshot:
+    return ManagedDocSnapshot(
+        content=content,
+        file_revision=file_revision,
+        applied_revision=applied_revision,
+        pending_apply=pending_apply,
+        apply_mode=apply_mode,
+        max_task_seconds=max_task_seconds,
     )
 
 
@@ -122,6 +144,14 @@ def make_harness():
         bso = stack.enter_context(
             patch("evo_agent.optimizer_runner.build_skill_document_operator"),
         )
+        # managed-doc operator factory mock（T11）。默认返回带空 records 的 applier。
+        bmo = stack.enter_context(
+            patch("evo_agent.optimizer_runner.build_managed_doc_operator"),
+        )
+        mock_md_op = MagicMock()
+        mock_md_op.applier.records = ()
+        mock_md_op.get_state.return_value = {"skill_content": "# baseline"}
+        bmo.return_value = mock_md_op
         ra_cls = stack.enter_context(
             patch(
                 "evo_agent.optimizer_runner.RemoteAgent",
@@ -175,6 +205,8 @@ def make_harness():
             adapter=mock_adapter,
             ac_cls=ac_cls,
             bso=bso,
+            bmo=bmo,
+            md_op=mock_md_op,
             ra_cls=ra_cls,
             ldm=ldm,
             cllm=cllm,
@@ -1204,3 +1236,153 @@ class TestBuildContextModelClientConfig:
         config = EvolveConfig(_env_file=None, llm_provider="OpenAI", llm_api_key="sk")
         cfg = _build_model_client_config(config)
         assert cfg.client_provider == "OpenAI"
+
+
+# ── managed-doc runner 分支（spec F7）──
+
+
+def _md_harness_with_snapshot(
+    make_harness: Callable[[], SimpleNamespace],
+    snapshot: ManagedDocSnapshot | None,
+) -> SimpleNamespace:
+    """构造 managed-doc harness：get_managed_doc_sync 返回给定 snapshot。
+
+    AsyncMock(spec=AdapterClient) 对 sync 方法的行为不稳定，故显式用 MagicMock
+    覆盖 ``get_managed_doc_sync``，保证 ``asyncio.to_thread`` 调用返回 snapshot。
+    """
+    h = make_harness()
+    h.adapter.get_managed_doc_sync = MagicMock(
+        return_value=snapshot if snapshot is not None else _make_valid_snapshot()
+    )
+    return h
+
+
+async def test_runner_managed_doc_canonical_id_used_as_operators_key_and_artifact_dir(
+    tmp_path: Path,
+    make_harness: Callable[[], SimpleNamespace],
+) -> None:
+    """canonical id 三处一致：operators key / artifact 目录 / skill_names（归因）。"""
+    snap = _make_valid_snapshot(content="# agent rule baseline")
+    h = _md_harness_with_snapshot(make_harness, snap)
+    request = _make_request(managed_doc_kind="agent_rule")
+    await h.run(request, _make_config(tmp_path))
+
+    # 1) 不调全局 restore（不变量 4：第二次优化不回滚上次发布版本）
+    h.adapter.restore_skill.assert_not_called()
+    # 2) 读 baseline snapshot
+    h.adapter.get_managed_doc_sync.assert_called_with("agent_rule")
+    # 3) factory 用 doc_kind=agent_rule（内部 skill_name=managed_doc:agent_rule）
+    assert h.bmo.call_args.kwargs["doc_kind"] == "agent_rule"
+    # 4) operators dict key == canonical id
+    operators = h.ra_cls.call_args.kwargs["operators"]
+    assert set(operators.keys()) == {"managed_doc:agent_rule"}
+    # 5) artifact 目录名 == canonical id
+    run_artifact_dir = h.rf_cls.call_args.args[0]
+    assert run_artifact_dir.name == "managed_doc:agent_rule"
+    # 6) trainer skill_names == [canonical id]（评估器经此归因）
+    assert h.trainer_cls.call_args.kwargs["skill_names"] == ["managed_doc:agent_rule"]
+
+
+async def test_runner_job_start_accepts_only_fully_applied_snapshot_no_global_restore(
+    tmp_path: Path,
+    make_harness: Callable[[], SimpleNamespace],
+) -> None:
+    """valid baseline → 不调 restore，直接进入 baseline rollout。"""
+    snap = _make_valid_snapshot()
+    h = _md_harness_with_snapshot(make_harness, snap)
+    await h.run(_make_request(managed_doc_kind="agent_rule"), _make_config(tmp_path))
+
+    h.adapter.restore_skill.assert_not_called()
+    h.adapter.get_managed_doc_sync.assert_called_with("agent_rule")
+    # baseline 内容固化为 managed_doc_before.md
+    before = (
+        _make_config(tmp_path).artifact_dir / "managed_doc:agent_rule" / "managed_doc_before.md"
+    )
+    assert before.read_text(encoding="utf-8") == snap.content
+
+
+async def test_runner_job_start_rejects_pending_apply_before_rollout(
+    tmp_path: Path,
+    make_harness: Callable[[], SimpleNamespace],
+) -> None:
+    """pending_apply=true → 不变量 5 违例，抛 ManagedDocBaselineError 不启动 rollout。"""
+    from evo_agent.errors import ManagedDocBaselineError
+
+    snap = _make_valid_snapshot(pending_apply=True)
+    h = _md_harness_with_snapshot(make_harness, snap)
+    with pytest.raises(ManagedDocBaselineError) as exc_info:
+        await h.run(_make_request(managed_doc_kind="agent_rule"), _make_config(tmp_path))
+    assert exc_info.value.reason == "pending_apply"
+    # 校验失败 → 不生成 before.md，但 observed.md + diagnostics 已落盘
+    art_dir = _make_config(tmp_path).artifact_dir / "managed_doc:agent_rule"
+    assert not (art_dir / "managed_doc_before.md").exists()
+    assert (art_dir / "managed_doc_observed.md").exists()
+    assert (art_dir / "managed_doc_diagnostics.json").exists()
+    # baseline 校验失败前不构建 operator、不训练
+    h.bmo.assert_not_called()
+    h.trainer.train.assert_not_called()
+
+
+async def test_runner_job_start_rejects_file_only_apply_mode(
+    tmp_path: Path,
+    make_harness: Callable[[], SimpleNamespace],
+) -> None:
+    """apply_mode != restart → baseline 不变量违例（不能在 file-only 模式做 restart 优化）。"""
+    from evo_agent.errors import ManagedDocBaselineError
+
+    snap = _make_valid_snapshot(apply_mode="file")
+    h = _md_harness_with_snapshot(make_harness, snap)
+    with pytest.raises(ManagedDocBaselineError) as exc_info:
+        await h.run(_make_request(managed_doc_kind="agent_rule"), _make_config(tmp_path))
+    assert exc_info.value.reason == "apply_mode"
+
+
+async def test_runner_job_start_rejects_deadline_below_max_task_seconds_plus_margin(
+    tmp_path: Path,
+    make_harness: Callable[[], SimpleNamespace],
+) -> None:
+    """deadline < max_task_seconds + 10s → 部署 deadline 不足，拒绝 baseline。"""
+    from evo_agent.errors import ManagedDocBaselineError
+
+    # config 默认 deadline=600s；max_task_seconds=601 → 600 < 611
+    snap = _make_valid_snapshot(max_task_seconds=601.0)
+    h = _md_harness_with_snapshot(make_harness, snap)
+    with pytest.raises(ManagedDocBaselineError) as exc_info:
+        await h.run(_make_request(managed_doc_kind="agent_rule"), _make_config(tmp_path))
+    assert exc_info.value.reason == "deadline"
+
+
+async def test_runner_second_run_does_not_rollback_prior_published_version(
+    tmp_path: Path,
+    make_harness: Callable[[], SimpleNamespace],
+) -> None:
+    """第二次优化：用当前已发布内容做 baseline，不调 restore，applier hash 命中 baseline no-op。"""
+    snap = _make_valid_snapshot(
+        content="# published v2",
+        file_revision="rev-published",
+        applied_revision="rev-published",
+    )
+    h = _md_harness_with_snapshot(make_harness, snap)
+    await h.run(_make_request(managed_doc_kind="agent_rule"), _make_config(tmp_path))
+
+    # 不调全局 restore（不变量 4）
+    h.adapter.restore_skill.assert_not_called()
+    # factory 用 snapshot 内容作 initial_content、applied_revision 作 last_success_hash
+    # （baseline 内容首次 set_parameter 时 hash 命中 no-op，不重复 POST/restore）
+    assert h.bmo.call_args.kwargs["initial_content"] == snap.content
+    assert h.bmo.call_args.kwargs["last_success_hash"] == snap.applied_revision
+
+
+async def test_runner_passes_canonical_id_to_evaluator_via_skill_names(
+    tmp_path: Path,
+    make_harness: Callable[[], SimpleNamespace],
+) -> None:
+    """评估器经 skill_names 收到 canonical id，单 operator short-circuit 精确归因。"""
+    snap = _make_valid_snapshot()
+    h = _md_harness_with_snapshot(make_harness, snap)
+    await h.run(_make_request(managed_doc_kind="agent_rule"), _make_config(tmp_path))
+    # trainer 持有 skill_names，rollout 时注入 case.inputs.skill_names 供评估器归因
+    assert h.trainer_cls.call_args.kwargs["skill_names"] == ["managed_doc:agent_rule"]
+    # RemoteAgent operators 唯一 key 即 canonical id（单 operator short-circuit 命中）
+    operators = h.ra_cls.call_args.kwargs["operators"]
+    assert list(operators.keys()) == ["managed_doc:agent_rule"]

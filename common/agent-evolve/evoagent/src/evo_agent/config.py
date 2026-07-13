@@ -4,10 +4,24 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Self
+from typing import Any, Literal, Self
 
-from pydantic import model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class ProtectedSectionConfig(BaseModel):
+    """managed-doc 受保护区段配置 DTO（叶子 config.py 定义，不导入 adapter_client）。
+
+    runner 把它映射为 adapter_client 侧的 frozen ``ProtectedSection``。一对
+    ``(start_marker, end_marker)`` 在 baseline 中圈定一段必须原样保留的原文；
+    marker 缺失/重复/交叉/嵌套由 ContentPolicy 初始化时 fail-fast。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    start_marker: str
+    end_marker: str
 
 
 class EvolveConfig(BaseSettings):
@@ -58,6 +72,21 @@ class EvolveConfig(BaseSettings):
         Path("/data/evo_agent"),
         Path("/tmp/evo_agent"),
     ]
+
+    # ── managed-doc 单文档优化 ──
+    # EVO_MANAGED_DOC_APPLY_DEADLINE：apply 同步等待总时限（秒），默认 600s。
+    # job-start 校验 deadline ≥ max_task_seconds + 10s（runner F7）。
+    managed_doc_apply_deadline: float = 600.0
+    # EVO_MANAGED_DOC_PROTECTED_SECTIONS（JSON）：dict[doc_kind, list[ProtectedSectionConfig]]，
+    # key 为精确 doc_kind。默认空（无受保护区段）。runner 映射为 adapter_client ProtectedSection。
+    managed_doc_protected_sections: dict[str, list[ProtectedSectionConfig]] = Field(
+        default_factory=dict
+    )
+    # EVO_MANAGED_DOC_CONTENT_POLICIES（JSON）：dict[doc_kind, "preserving"|"passthrough"]。
+    # 缺省 kind 走 preserving（runner 侧 selector 默认）。
+    managed_doc_content_policies: dict[str, Literal["preserving", "passthrough"]] = Field(
+        default_factory=dict
+    )
 
     @model_validator(mode="before")
     @classmethod

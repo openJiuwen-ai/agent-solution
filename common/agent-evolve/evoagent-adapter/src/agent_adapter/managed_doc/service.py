@@ -108,6 +108,9 @@ class ManagedDocService:
             "file_revision": file_sha,
             "applied_revision": applied,
             "pending_apply": file_sha != applied,
+            # G2.3: 暴露 apply 能力与时限上界，供消费方做 deadline 校验（file_only→0）。
+            "apply_mode": cfg.apply,
+            "max_task_seconds": self._registry.max_task_seconds(agent_name, doc_kind),
         }
 
     # ── task polling (spec §7.3) ────────────────────────────────────

@@ -25,6 +25,7 @@ from agent_adapter.config import (
     ManagedDocConfig,
     ManagedDocDefaults,
 )
+from agent_adapter.managed_doc.deadline import compute_max_task_seconds
 from agent_adapter.managed_doc.storage import (
     AgentNotFoundError,
     DocNotFoundError,
@@ -59,12 +60,15 @@ class ManagedDocRegistry:
         defaults: ManagedDocDefaults,
     ) -> None:
         self._map: dict[str, dict[str, ManagedDocConfig]] = {}
+        # G2.2: 构建期计算并缓存 max_task_seconds，避免 content 每次重算。
+        self._deadlines: dict[str, dict[str, int]] = {}
         # Guard against silent cross-agent .meta/snapshot collision (I2): two
         # docs sharing (parent_dir, kind) would share .meta/{kind}.* and step on
         # each other. Fail at build time instead.
         seen: set[tuple[str, str]] = set()
         for agent in agents:
             by_kind: dict[str, ManagedDocConfig] = {}
+            by_deadline: dict[str, int] = {}
             for doc in agent.managed_docs:
                 resolved = self._resolve(agent, doc, defaults)
                 key = (str(Path(doc.path).resolve().parent), doc.kind)
@@ -75,7 +79,9 @@ class ManagedDocRegistry:
                     )
                 seen.add(key)
                 by_kind[doc.kind] = resolved
+                by_deadline[doc.kind] = compute_max_task_seconds(resolved)
             self._map[agent.name] = by_kind
+            self._deadlines[agent.name] = by_deadline
 
     @classmethod
     def from_config(cls, config: AdapterConfig) -> ManagedDocRegistry:
@@ -91,6 +97,16 @@ class ManagedDocRegistry:
                 f"doc_kind '{doc_kind}' not registered for agent '{agent_name}'"
             )
         return doc
+
+    def max_task_seconds(self, agent_name: str, doc_kind: str) -> int:
+        """Return the cached G2.2 worst-case upper bound (build-time computed).
+
+        file_only docs cache 0; restart docs cache the fixed-formula ceiling.
+        Mirrors ``get``'s not-found contract so callers see the same 404 paths.
+        """
+        # 触发与 get 相同的 not-found 错误，再返回缓存值（避免 content 重算）。
+        self.get(agent_name, doc_kind)
+        return self._deadlines[agent_name][doc_kind]
 
     def agents(self) -> list[str]:
         return list(self._map.keys())

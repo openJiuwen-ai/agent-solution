@@ -246,4 +246,9 @@ async def test_content_success_body_shape(tmp_path: Path) -> None:
             "file_revision",
             "applied_revision",
             "pending_apply",
+            "apply_mode",  # G2.3 新增
+            "max_task_seconds",  # G2.3 新增
         }
+        # file_only doc：apply_mode 与 max_task_seconds 语义
+        assert data["apply_mode"] == "file_only"
+        assert data["max_task_seconds"] == 0

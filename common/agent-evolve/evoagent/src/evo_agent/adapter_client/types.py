@@ -63,6 +63,6 @@ class TaskState:
     pending_apply: bool
     last_error: str | None
     attempts: int
-    down_seen: int
+    down_seen: bool | None
     created_at: str | None
     updated_at: str | None

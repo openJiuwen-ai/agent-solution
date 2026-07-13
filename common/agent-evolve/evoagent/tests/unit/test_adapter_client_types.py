@@ -105,7 +105,7 @@ class TestTaskState:
             pending_apply=True,
             last_error=None,
             attempts=1,
-            down_seen=0,
+            down_seen=False,
             created_at="2026-07-13T00:00:00Z",
             updated_at="2026-07-13T00:00:01Z",
         )
@@ -124,7 +124,7 @@ class TestTaskState:
         assert ts.pending_apply is True
         assert ts.last_error is None
         assert ts.attempts == 1
-        assert ts.down_seen == 0
+        assert ts.down_seen is False
         assert ts.created_at == "2026-07-13T00:00:00Z"
         assert ts.updated_at == "2026-07-13T00:00:01Z"
 

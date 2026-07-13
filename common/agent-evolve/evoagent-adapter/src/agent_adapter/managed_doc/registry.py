@@ -111,6 +111,8 @@ class ManagedDocRegistry:
             "path": doc.path,
             "allow_root": doc.allow_root,
             "apply": "restart",
+            # G1/C8: max_content_bytes 无 profile 基线，doc 显式值或默认（262_144）。
+            "max_content_bytes": doc.max_content_bytes,
         }
 
         # profile 背书的参数：doc > defaults 显式 > profile 基线

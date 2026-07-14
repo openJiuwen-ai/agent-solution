@@ -17,9 +17,8 @@ import asyncio
 import json
 import math
 import random
-import re
 import time
-from dataclasses import replace
+from dataclasses import asdict, replace
 from typing import TYPE_CHECKING, Any, cast
 
 from openjiuwen.agent_evolving.dataset import Case, CaseLoader, EvaluatedCase
@@ -31,17 +30,42 @@ from openjiuwen.agent_evolving.trajectory.types import (
     Trajectory,
 )
 from openjiuwen.core.common.logging import logger
+from openjiuwen.core.foundation.llm.schema.message import UserMessage
 
 from evo_agent.adapter_client.operator import split_frontmatter
+from evo_agent.evaluator.batch_result import (
+    EvaluationBatchResult,
+    EvaluationFailure,
+    EvaluationOutcome,
+)
+from evo_agent.evaluator.json_util import JsonRepairPolicy, extract_json
+from evo_agent.llm.invocation import (
+    LLMInvocation,
+    LLMInvocationResult,
+    LLMProviderCapabilities,
+    PromptBudgetExceededError,
+)
+from evo_agent.llm.trajectory_compaction import (
+    TrajectoryCompactionContext,
+    TrajectoryCompactionPolicy,
+    compact_trajectory,
+)
 from evo_agent.optimizer.llm_resilience import (
     LLMInvokePolicy,
-    invoke_text_with_retry,
+    invoke_with_retry,
 )
 from evo_agent.optimizer.skill_document.artifact_exporter import ArtifactExporter
 from evo_agent.optimizer.skill_document.edit_apply import apply_patch_with_report
 from evo_agent.optimizer.skill_document.prompts import load_skill_opt_prompt
 from evo_agent.optimizer.skill_document.scheduler import build_scheduler
-from evo_agent.optimizer.skill_document.types import AttributedBatch, Edit, Patch, RawPatch
+from evo_agent.optimizer.skill_document.types import (
+    AttributedBatch,
+    Edit,
+    GateEpochArtifactInput,
+    Patch,
+    RawPatch,
+    ValidationCoverageFailureInput,
+)
 from evo_agent.optimizer.skill_document.update_modes import (
     normalize_update_mode,
 )
@@ -88,56 +112,6 @@ _RANKING_POLICY = LLMInvokePolicy(
 )
 
 
-# ── JSON helpers (private to this module) ──────────────────────────────────
-
-
-def _fix_json_text(text: str) -> str:
-    text = text.strip()
-    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.MULTILINE)
-    text = re.sub(r"```\s*$", "", text, flags=re.MULTILINE)
-    text = re.sub(r"//[^\n]*", "", text)
-    text = re.sub(r",\s*([}\]])", r"\1", text)
-    return text.strip()
-
-
-def _extract_json(raw: str) -> Any | None:
-    """Best-effort JSON extraction from LLM output."""
-    raw = raw.strip()
-    if not raw:
-        return None
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        pass
-    fixed = _fix_json_text(raw)
-    try:
-        return json.loads(fixed)
-    except json.JSONDecodeError:
-        pass
-    for pattern in (r"\{[\s\S]*\}", r"\[[\s\S]*\]"):
-        matched = re.search(pattern, fixed)
-        if matched:
-            try:
-                return json.loads(matched.group(0))
-            except json.JSONDecodeError:
-                try:
-                    return json.loads(_fix_json_text(matched.group(0)))
-                except json.JSONDecodeError:
-                    pass
-    return None
-
-
-def _extract_json_with_error(raw: str) -> tuple[Any | None, str]:
-    """Like _extract_json but returns (result, error_msg)."""
-    raw = raw.strip()
-    if not raw:
-        return None, "empty response"
-    result = _extract_json(raw)
-    if result is not None:
-        return result, ""
-    return None, "failed to parse JSON from LLM response"
-
-
 # ── Trajectory formatting helpers ─────────────────────────────────────────
 
 
@@ -163,6 +137,35 @@ def _extract_task_description(case: Case) -> str:
         if key in inputs:
             return str(inputs[key])[:500]
     return str(inputs)[:500]
+
+
+def _legacy_training_batch(
+    cases: list[Case],
+    trajectories: list[Any],
+    evaluated: list[EvaluatedCase],
+) -> EvaluationBatchResult:
+    """Adapt a legacy success-only evaluator to the lossless batch interface."""
+    evaluated_by_id = {item.case.case_id: item for item in evaluated}
+    outcomes: list[EvaluationOutcome] = []
+    for index, (case, trajectory) in enumerate(zip(cases, trajectories)):
+        evaluated_case = evaluated_by_id.get(case.case_id)
+        failure = None
+        if evaluated_case is None:
+            failure = EvaluationFailure(
+                category="schema_validation_error",
+                safe_message="legacy evaluator returned no result for this case",
+            )
+        outcomes.append(
+            EvaluationOutcome(
+                index=index,
+                case_id=case.case_id,
+                case=case,
+                trajectory=trajectory,
+                evaluated=evaluated_case,
+                failure=failure,
+            )
+        )
+    return EvaluationBatchResult(tuple(outcomes))
 
 
 # ── Main optimizer class ──────────────────────────────────────────────────
@@ -198,6 +201,7 @@ class SkillDocumentOptimizer(BaseOptimizer):  # type: ignore[misc]
         extractor: TracerTrajectoryExtractor | None = None,
         num_parallel: int = 4,
         llm: Model,
+        llm_invocation: LLMInvocation | None = None,
         model: str,
         train_cases: CaseLoader,
         batch_size: int = 40,
@@ -245,7 +249,20 @@ class SkillDocumentOptimizer(BaseOptimizer):  # type: ignore[misc]
         self._extractor = extractor or TracerTrajectoryExtractor()
         self._num_parallel = num_parallel
         self._train_cases = train_cases
-        self._llm = llm
+        self._llm = llm_invocation or LLMInvocation(
+            llm,
+            capabilities=LLMProviderCapabilities(
+                context_window_tokens=32768,
+                supports_max_output_tokens=False,
+                supports_finish_reason=True,
+                supports_usage=True,
+                supports_json_mode=True,
+                completion_signal="either",
+            ),
+            parallelism=parallelism,
+            safety_margin_tokens=512,
+            chars_per_token=2.0,
+        )
         self._model = model
 
         # Hyperparameters
@@ -254,7 +271,6 @@ class SkillDocumentOptimizer(BaseOptimizer):  # type: ignore[misc]
         self._minibatch_size = minibatch_size
         self._update_mode = normalize_update_mode(update_mode)
         self._score_threshold = score_threshold
-        self._semaphore = asyncio.Semaphore(parallelism)
 
         # Trajectory formatting params
         self._max_chars_per_traj = max_chars_per_traj
@@ -310,9 +326,11 @@ class SkillDocumentOptimizer(BaseOptimizer):  # type: ignore[misc]
         self._artifact_export_trajectories = artifact_export_trajectories
         self._artifact_exporter = ArtifactExporter(
             artifact_dir,
+            score_threshold=score_threshold,
             export_trajectories=artifact_export_trajectories,
         )
         self._artifact_epoch = -1
+        self._last_training_batch: EvaluationBatchResult | None = None
 
     @staticmethod
     def requires_forward_data() -> bool:
@@ -422,16 +440,48 @@ class SkillDocumentOptimizer(BaseOptimizer):  # type: ignore[misc]
         predicts = [r[0] for r in results]
         sessions = [r[1] for r in results]
 
-        evaluated = self._evaluator.batch_evaluate(
-            cases,
-            predicts,
-            num_parallel=self._num_parallel,
-        )
         trajectories = [
             self._extractor.extract(sess, case_id=case.case_id)
             for case, sess in zip(cases, sessions)
         ]
-        return evaluated, trajectories
+        batch = self._evaluate_training_batch(cases, predicts, trajectories)
+        return list(batch.successes), trajectories
+
+    def _evaluate_training_batch(
+        self,
+        cases: list[Case],
+        predicts: list[dict[str, Any]],
+        trajectories: list[Any],
+        *,
+        enable_attribution: bool | None = None,
+    ) -> EvaluationBatchResult:
+        """Evaluate training cases without dropping failure diagnostics."""
+        detailed_evaluate = vars(self._evaluator).get("batch_evaluate_detailed")
+        if detailed_evaluate is None:
+            detailed_method = getattr(type(self._evaluator), "batch_evaluate_detailed", None)
+            if detailed_method is not None:
+                detailed_evaluate = detailed_method.__get__(self._evaluator)
+        evaluation_options: dict[str, Any] = {"num_parallel": self._num_parallel}
+        if enable_attribution is not None:
+            evaluation_options["enable_attribution"] = enable_attribution
+        if callable(detailed_evaluate):
+            batch = cast(
+                EvaluationBatchResult,
+                detailed_evaluate(
+                    cases,
+                    predicts,
+                    **evaluation_options,
+                ),
+            )
+        else:
+            evaluated = self._evaluator.batch_evaluate(
+                cases,
+                predicts,
+                **evaluation_options,
+            )
+            batch = _legacy_training_batch(cases, trajectories, evaluated)
+        self._last_training_batch = batch
+        return batch
 
     # ── Attribution ──────────────────────────────────────────────────────
 
@@ -444,9 +494,9 @@ class SkillDocumentOptimizer(BaseOptimizer):  # type: ignore[misc]
     ) -> dict[str, list[RawPatch]]:
         """Run reflect for all operators concurrently (C2 / #3).
 
-        Cross-operator ``asyncio.gather``；每个 operator 的 _reflect 内部经
-        ``self._semaphore``（run_analyst → invoke_text_with_retry）约束总 LLM
-        并发，故此处不外加 semaphore 以避免双重获取死锁。总并发仍 ≤ parallelism。
+        Cross-operator ``asyncio.gather``；每个 operator 的 _reflect 最终进入
+        run-scoped ``LLMInvocation`` 获取 permit，故此处不外加 semaphore，避免
+        双重获取死锁。总并发仍 ≤ parallelism。
 
         Fail-fast 语义（与串行版一致）：不使用 ``return_exceptions=True``。
         若某 operator 的 _reflect 抛出未被内层 run_analyst 吞掉的异常，
@@ -504,9 +554,9 @@ class SkillDocumentOptimizer(BaseOptimizer):  # type: ignore[misc]
     ) -> tuple[dict[str, int], dict[str, int], Patch, list[Edit]]:
         """Cross-operator aggregate→select→apply concurrent (C4 / #19).
 
-        每个 operator 的 aggregate/select 经 self._semaphore（_llm_merge_edits /
-        _select 内部 invoke_text_with_retry）约束总 LLM 并发，跨 operator gather
-        不外加 semaphore。各 operator 仅写自身 key，无跨 operator 写冲突。
+        每个 operator 的 aggregate/select 经 run-scoped ``LLMInvocation`` 约束
+        总 LLM 并发，跨 operator gather 不外加 semaphore。各 operator 仅写自身
+        key，无跨 operator 写冲突。
         返回 (n_merged, n_selected, last_merged, last_selected) 供向后兼容字段。
 
         Fail-fast 语义（与串行版一致，见 _reflect_all_operators docstring）：不使用
@@ -717,18 +767,129 @@ class SkillDocumentOptimizer(BaseOptimizer):  # type: ignore[misc]
         if batch_data is not None:
             failure_batch = [item for item in batch_data if item[1].score < score_threshold]
             success_batch = [item for item in batch_data if item[1].score >= score_threshold]
-            failure_text = self._format_batch(failure_batch) if failure_batch else ""
-            success_text = self._format_batch(success_batch) if success_batch else ""
-        else:
-            failure_text = formatted_batch
-            success_text = formatted_batch
+            calls = []
+            for source_type, source_batch in (
+                ("failure", failure_batch),
+                ("success", success_batch),
+            ):
+                if isinstance(getattr(self, "_llm", None), LLMInvocation):
+                    formatted_batches = self._build_reflect_batches(
+                        source_batch,
+                        source_type=source_type,
+                        skill_content=skill_content,
+                        operator_id=operator_id,
+                    )
+                else:
+                    # Compatibility for subclasses/tests constructed without the
+                    # production run-scoped invocation module.
+                    formatted_batches = [
+                        self._format_batch(source_batch[start : start + self._minibatch_size])
+                        for start in range(0, len(source_batch), self._minibatch_size)
+                    ]
+                for formatted in formatted_batches:
+                    source_ids = tuple(
+                        case.case_id
+                        for trajectory, evaluated, case in source_batch
+                        if f"(id={case.case_id})" in formatted
+                    )
+                    calls.append(
+                        self._reflect_for_operator(
+                            operator_id=operator_id,
+                            formatted_failures=(formatted if source_type == "failure" else ""),
+                            formatted_successes=(formatted if source_type == "success" else ""),
+                            skill_content=skill_content,
+                            source_ids=source_ids,
+                        )
+                    )
+            if not calls:
+                return []
+            return [patch for patches in await asyncio.gather(*calls) for patch in patches]
 
         return await self._reflect_for_operator(
             operator_id=operator_id,
-            formatted_failures=failure_text,
-            formatted_successes=success_text,
+            formatted_failures=formatted_batch,
+            formatted_successes=formatted_batch,
             skill_content=skill_content,
         )
+
+    def _build_reflect_batches(
+        self,
+        source_batch: list[tuple[Trajectory, EvaluatedCase, Case]],
+        *,
+        source_type: str,
+        skill_content: str,
+        operator_id: str,
+    ) -> list[str]:
+        """Compact and greedily pack trajectories against the exact final prompt."""
+        if not source_batch:
+            return []
+        template = "analyst_error" if source_type == "failure" else "analyst_success"
+        step_context = self._format_step_buffer()
+        meta_context = self._format_meta_skill_context()
+        input_budget = self._llm.input_token_budget("reflect")
+        empty_prompt = self._build_analyst_prompt(
+            template, skill_content, "", step_context, meta_context
+        )
+        fixed_tokens = self._llm.estimate_messages((UserMessage(content=empty_prompt),))
+
+        batches: list[str] = []
+        current: list[str] = []
+        for index, (trajectory, evaluated, case) in enumerate(source_batch, 1):
+            header = (
+                f"### Trajectory {index} (id={case.case_id})\n"
+                f"Task: {_extract_task_description(case)}\n"
+                f"Score: {evaluated.score:.2f}\n"
+            )
+            if evaluated.reason:
+                header += f"Reason: {evaluated.reason}\n"
+            header_tokens = self._llm.estimate_messages((UserMessage(content=header),))
+            remaining = input_budget - fixed_tokens - header_tokens - 8
+            if remaining < 1:
+                required = fixed_tokens + header_tokens + 8
+                overhead = self._llm.capabilities.context_window_tokens - input_budget
+                raise PromptBudgetExceededError(
+                    required + overhead, self._llm.capabilities.context_window_tokens
+                )
+            compacted = compact_trajectory(
+                trajectory,
+                policy=TrajectoryCompactionPolicy(
+                    stage="reflect",
+                    preserve_evaluation_reason=True,
+                    prioritize_skill_related=bool(operator_id),
+                ),
+                context=TrajectoryCompactionContext(
+                    task_goal=_extract_task_description(case),
+                    evaluation_score=evaluated.score,
+                    evaluation_reason=evaluated.reason or None,
+                    target_skills=(operator_id,) if operator_id else (),
+                ),
+                # The shared compactor's fallback estimator is chars/2. Halving
+                # the provider-space allowance remains safe for chars/token >= 1.
+                token_budget=max(1, remaining // 2),
+            )
+            item = header + "\n" + compacted.text
+            tentative = "\n\n---\n\n".join([*current, item])
+            prompt = self._build_analyst_prompt(
+                template, skill_content, tentative, step_context, meta_context
+            )
+            estimated = self._llm.estimate_messages((UserMessage(content=prompt),))
+            if current and (len(current) >= self._minibatch_size or estimated > input_budget):
+                batches.append("\n\n---\n\n".join(current))
+                current = [item]
+                prompt = self._build_analyst_prompt(
+                    template, skill_content, item, step_context, meta_context
+                )
+                estimated = self._llm.estimate_messages((UserMessage(content=prompt),))
+            else:
+                current.append(item)
+            if estimated > input_budget:
+                overhead = self._llm.capabilities.context_window_tokens - input_budget
+                raise PromptBudgetExceededError(
+                    estimated + overhead, self._llm.capabilities.context_window_tokens
+                )
+        if current:
+            batches.append("\n\n---\n\n".join(current))
+        return batches
 
     async def _reflect_for_operator(
         self,
@@ -737,6 +898,7 @@ class SkillDocumentOptimizer(BaseOptimizer):  # type: ignore[misc]
         formatted_failures: str,
         formatted_successes: str,
         skill_content: str,
+        source_ids: tuple[str, ...] = (),
     ) -> list[RawPatch]:
         """Run reflect analysts for a single operator, tag patches with operator_id."""
         if not formatted_failures.strip() and not formatted_successes.strip():
@@ -784,23 +946,28 @@ class SkillDocumentOptimizer(BaseOptimizer):  # type: ignore[misc]
             tasks.append(("success", success_prompt, success_retry))
 
         async def run_analyst(source_type: str, prompt: str, retry_prompt: str) -> RawPatch | None:
-            async with self._semaphore:
-                try:
-                    raw = await invoke_text_with_retry(
-                        self._llm,
-                        self._model,
-                        prompt,
-                        policy=_REFLECT_POLICY,
-                        retry_prompt=retry_prompt,
-                    )
-                    return self._parse_reflect_response(raw, source_type)
-                except Exception as exc:
-                    logger.warning(
-                        "[skill_doc_opt] reflect %s failed: %s",
-                        source_type,
-                        exc,
-                    )
-                    return None
+            try:
+                invocation = await invoke_with_retry(
+                    self._llm,
+                    self._model,
+                    prompt,
+                    policy=_REFLECT_POLICY,
+                    stage="reflect",
+                    retry_prompt=retry_prompt,
+                )
+                return self._parse_reflect_response(
+                    invocation,
+                    source_type,
+                    operator_id=operator_id,
+                    source_ids=source_ids,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[skill_doc_opt] reflect %s failed: %s",
+                    source_type,
+                    exc,
+                )
+                return None
 
         results = await asyncio.gather(*[run_analyst(st, p, rp) for st, p, rp in tasks])
 
@@ -845,16 +1012,33 @@ class SkillDocumentOptimizer(BaseOptimizer):  # type: ignore[misc]
 
     def _parse_reflect_response(
         self,
-        raw: str,
+        response: str | LLMInvocationResult,
         source_type: str,
+        *,
+        operator_id: str = "",
+        source_ids: tuple[str, ...] = (),
     ) -> RawPatch | None:
         """Parse and validate an analyst LLM response into a RawPatch."""
-        result, error = _extract_json_with_error(raw)
+        raw = response.text if isinstance(response, LLMInvocationResult) else response
+        extraction = extract_json(raw, policy=JsonRepairPolicy())
+        result = extraction.data
         if result is None:
             logger.warning(
-                "[skill_doc_opt] reflect JSON parse failed (%s): %s",
+                "[skill_doc_opt] reflect JSON parse failed source_type=%s operator=%s "
+                "invocation_id=%s stage=reflect prompt_estimated_tokens=%s "
+                "output_reserve_tokens=%s finish_reason=%s raw_response=%s error=%s",
                 source_type,
-                error,
+                operator_id or "unknown",
+                response.invocation_id if isinstance(response, LLMInvocationResult) else "unknown",
+                response.metadata.get("estimated_input_tokens", "unknown")
+                if isinstance(response, LLMInvocationResult)
+                else "unknown",
+                response.metadata.get("output_reserve_tokens", "unknown")
+                if isinstance(response, LLMInvocationResult)
+                else "unknown",
+                response.finish_reason if isinstance(response, LLMInvocationResult) else "unknown",
+                json.dumps(raw, ensure_ascii=False),
+                extraction.error,
             )
             return None
 
@@ -885,6 +1069,7 @@ class SkillDocumentOptimizer(BaseOptimizer):  # type: ignore[misc]
                     target=str(ed.get("target", "")),
                     support_count=int(ed.get("support_count", 0) or 0),
                     source_type=source_type,
+                    source_ids=source_ids,
                 )
             )
 
@@ -894,6 +1079,12 @@ class SkillDocumentOptimizer(BaseOptimizer):  # type: ignore[misc]
                 patch=Patch(edits=[], reasoning="no valid edits"),
                 source_type=source_type,
                 failure_summary=str(result.get("failure_summary", "")),
+                repaired=extraction.parse_mode not in {"exact", "failed"},
+                parse_mode=extraction.parse_mode,
+                repair_operations=tuple(
+                    asdict(operation) for operation in extraction.repair_operations
+                ),
+                source_ids=source_ids,
             )
 
         reasoning = str(result.get("reasoning", patch_data.get("reasoning", "")))
@@ -903,6 +1094,12 @@ class SkillDocumentOptimizer(BaseOptimizer):  # type: ignore[misc]
             patch=Patch(edits=valid_edits, reasoning=reasoning),
             source_type=source_type,
             failure_summary=failure_summary,
+            repaired=extraction.parse_mode not in {"exact", "failed"},
+            parse_mode=extraction.parse_mode,
+            repair_operations=tuple(
+                asdict(operation) for operation in extraction.repair_operations
+            ),
+            source_ids=source_ids,
         )
 
     # ── Aggregate ────────────────────────────────────────────────────────
@@ -939,18 +1136,18 @@ class SkillDocumentOptimizer(BaseOptimizer):  # type: ignore[misc]
         meta_ctx = self._format_meta_skill_context()
 
         # Stage 1 + Stage 2: merge failure / success patches concurrently (C3 / #7).
-        # 两者相互独立，并发执行；各 _llm_merge_edits 内部经 self._semaphore
-        # 约束总 LLM 并发。Stage 3 依赖 1+2 结果，仍串行在之后。
+        # 两者最终由 run-scoped LLMInvocation 约束总并发；Stage 3 依赖 1+2
+        # 结果，仍串行在之后。
         async def _merge_failure() -> list[Edit]:
             if len(f_edits) > 1:
-                return await self._llm_merge_edits(
+                return await self._bounded_merge_edits(
                     f_edits, "merge_failure", skill_content, meta_ctx
                 )
             return f_edits
 
         async def _merge_success() -> list[Edit]:
             if len(s_edits) > 1:
-                return await self._llm_merge_edits(
+                return await self._bounded_merge_edits(
                     s_edits, "merge_success", skill_content, meta_ctx
                 )
             return s_edits
@@ -965,13 +1162,101 @@ class SkillDocumentOptimizer(BaseOptimizer):  # type: ignore[misc]
         if len(combined) <= 3:
             return Patch(edits=combined, reasoning="final: <=3 edits after stages")
 
-        final_edits = await self._llm_merge_edits(
+        final_edits = await self._bounded_merge_edits(
             combined,
             "merge_final",
             skill_content,
             meta_ctx,
         )
         return Patch(edits=final_edits, reasoning="three-stage LLM merge")
+
+    async def _bounded_merge_edits(
+        self,
+        edits: list[Edit],
+        template_name: str,
+        skill_content: str,
+        meta_skill_context: str,
+        *,
+        depth: int = 0,
+    ) -> list[Edit]:
+        """Merge stable token-bounded groups, then recursively merge their outputs."""
+        groups = self._pack_merge_groups(edits, template_name, skill_content, meta_skill_context)
+        merged_groups = await asyncio.gather(
+            *[
+                self._llm_merge_edits(group, template_name, skill_content, meta_skill_context)
+                if len(group) > 1
+                else asyncio.sleep(0, result=group)
+                for group in groups
+            ]
+        )
+        merged = [edit for group in merged_groups for edit in group]
+        if len(groups) > 1 and len(merged) < len(edits) and depth < 8:
+            return await self._bounded_merge_edits(
+                merged,
+                template_name,
+                skill_content,
+                meta_skill_context,
+                depth=depth + 1,
+            )
+        return merged
+
+    def _pack_merge_groups(
+        self,
+        edits: list[Edit],
+        template_name: str,
+        skill_content: str,
+        meta_skill_context: str,
+    ) -> list[list[Edit]]:
+        """Greedily group edits while each exact merge prompt fits its input budget."""
+        if not edits:
+            return []
+        if not isinstance(getattr(self, "_llm", None), LLMInvocation):
+            return [edits]
+        input_budget = self._llm.input_token_budget("merge")
+        groups: list[list[Edit]] = []
+        current: list[Edit] = []
+        for edit in edits:
+            tentative = [*current, edit]
+            prompt, _ = self._build_merge_prompts(
+                tentative, template_name, skill_content, meta_skill_context
+            )
+            estimated = self._llm.estimate_messages((UserMessage(content=prompt),))
+            if current and estimated > input_budget:
+                groups.append(current)
+                current = [edit]
+            else:
+                current = tentative
+        if current:
+            groups.append(current)
+        return groups
+
+    def _build_merge_prompts(
+        self,
+        edits: list[Edit],
+        template_name: str,
+        skill_content: str,
+        meta_skill_context: str,
+    ) -> tuple[str, str]:
+        edits_dicts = [
+            {
+                "op": edit.op,
+                "content": edit.content,
+                "target": edit.target,
+                "support_count": edit.support_count,
+                "source_type": edit.source_type,
+                "source_ids": list(edit.source_ids),
+            }
+            for edit in edits
+        ]
+        system = load_skill_opt_prompt(template_name)
+        user = f"## Current Skill\n{skill_content}\n\n"
+        if meta_skill_context.strip():
+            user += f"## Optimizer Memory\n{meta_skill_context}\n\n"
+        edits_json = _dumps_for_prompt(edits_dicts)
+        user += f"## Edits to merge ({len(edits)} total)\n{edits_json}"
+        slim_user = f"## Current Skill\n{skill_content}\n\n"
+        slim_user += f"## Edits to merge ({len(edits)} total)\n{edits_json}"
+        return f"{system}\n\n{user}", f"{system}\n\n{slim_user}"
 
     async def _llm_merge_edits(
         self,
@@ -981,40 +1266,27 @@ class SkillDocumentOptimizer(BaseOptimizer):  # type: ignore[misc]
         meta_skill_context: str,
     ) -> list[Edit]:
         """Call LLM to merge edits, with fallback to concatenation."""
-        edits_dicts = [
-            {
-                "op": e.op,
-                "content": e.content,
-                "target": e.target,
-                "support_count": e.support_count,
-                "source_type": e.source_type,
-            }
-            for e in edits
-        ]
-        system = load_skill_opt_prompt(template_name)
-        user = f"## Current Skill\n{skill_content}\n\n"
-        if meta_skill_context.strip():
-            user += f"## Optimizer Memory\n{meta_skill_context}\n\n"
-        edits_json = _dumps_for_prompt(edits_dicts)
-        user += f"## Edits to merge ({len(edits)} total)\n{edits_json}"
-        prompt = f"{system}\n\n{user}"
-        # B4: 精简 retry_prompt 去掉 Optimizer Memory，超时重试用。
-        slim_user = f"## Current Skill\n{skill_content}\n\n"
-        slim_user += f"## Edits to merge ({len(edits)} total)\n{edits_json}"
-        retry_prompt = f"{system}\n\n{slim_user}"
+        prompt, retry_prompt = self._build_merge_prompts(
+            edits, template_name, skill_content, meta_skill_context
+        )
 
         try:
-            async with self._semaphore:
-                raw = await invoke_text_with_retry(
-                    self._llm,
-                    self._model,
-                    prompt,
-                    policy=_AGGREGATE_POLICY,
-                    retry_prompt=retry_prompt,
-                )
-            result = _extract_json(raw)
+            invocation = await invoke_with_retry(
+                self._llm,
+                self._model,
+                prompt,
+                policy=_AGGREGATE_POLICY,
+                stage="merge",
+                retry_prompt=retry_prompt,
+            )
+            raw = invocation.text
+            extraction = extract_json(raw, policy=JsonRepairPolicy())
+            result = extraction.data
             if result and isinstance(result, dict) and "edits" in result:
                 merged = []
+                input_source_ids = tuple(
+                    dict.fromkeys(source_id for edit in edits for source_id in edit.source_ids)
+                )
                 for ed in result["edits"]:
                     if not isinstance(ed, dict):
                         continue
@@ -1028,10 +1300,34 @@ class SkillDocumentOptimizer(BaseOptimizer):  # type: ignore[misc]
                             target=str(ed.get("target", "")),
                             support_count=int(ed.get("support_count", 0) or 0),
                             source_type=str(ed.get("source_type", "failure")),
+                            source_ids=tuple(
+                                source_id
+                                for source_id in ed.get("source_ids", input_source_ids)
+                                if isinstance(source_id, str)
+                            ),
                         )
                     )
                 if merged:
+                    retained = {source_id for edit in merged for source_id in edit.source_ids}
+                    missing = tuple(
+                        source_id for source_id in input_source_ids if source_id not in retained
+                    )
+                    if missing:
+                        merged[0] = replace(merged[0], source_ids=(*merged[0].source_ids, *missing))
                     return merged
+            if result is None:
+                logger.warning(
+                    "[skill_doc_opt] aggregate JSON parse failed stage=%s "
+                    "invocation_id=%s prompt_estimated_tokens=%s "
+                    "output_reserve_tokens=%s finish_reason=%s error=%s raw_response=%s",
+                    template_name,
+                    invocation.invocation_id,
+                    invocation.metadata.get("estimated_input_tokens", "unknown"),
+                    invocation.metadata.get("output_reserve_tokens", "unknown"),
+                    invocation.finish_reason or "unknown",
+                    extraction.error,
+                    json.dumps(raw, ensure_ascii=False),
+                )
         except Exception as exc:
             logger.warning(
                 "[skill_doc_opt] aggregate %s failed, using fallback: %s",
@@ -1103,15 +1399,17 @@ class SkillDocumentOptimizer(BaseOptimizer):  # type: ignore[misc]
         retry_prompt = f"{system}\n\n{slim_user}"
 
         try:
-            async with self._semaphore:
-                raw = await invoke_text_with_retry(
-                    self._llm,
-                    self._model,
-                    prompt,
-                    policy=_RANKING_POLICY,
-                    retry_prompt=retry_prompt,
-                )
-            result = _extract_json(raw)
+            invocation = await invoke_with_retry(
+                self._llm,
+                self._model,
+                prompt,
+                policy=_RANKING_POLICY,
+                stage="ranking",
+                retry_prompt=retry_prompt,
+            )
+            raw = invocation.text
+            extraction = extract_json(raw, policy=JsonRepairPolicy())
+            result = extraction.data
             if result and isinstance(result, dict) and "selected_indices" in result:
                 indices = result["selected_indices"]
                 selected: list[Edit] = []
@@ -1124,6 +1422,18 @@ class SkillDocumentOptimizer(BaseOptimizer):  # type: ignore[misc]
                         break
                 if selected:
                     return selected
+            if result is None:
+                logger.warning(
+                    "[skill_doc_opt] ranking JSON parse failed invocation_id=%s "
+                    "prompt_estimated_tokens=%s output_reserve_tokens=%s "
+                    "finish_reason=%s error=%s raw_response=%s",
+                    invocation.invocation_id,
+                    invocation.metadata.get("estimated_input_tokens", "unknown"),
+                    invocation.metadata.get("output_reserve_tokens", "unknown"),
+                    invocation.finish_reason or "unknown",
+                    extraction.error,
+                    json.dumps(raw, ensure_ascii=False),
+                )
         except Exception as exc:
             logger.warning(
                 "[skill_doc_opt] select ranking failed, fallback truncation: %s",
@@ -1187,6 +1497,7 @@ class SkillDocumentOptimizer(BaseOptimizer):  # type: ignore[misc]
             }
             step_before_skill = self._current_skill_content
             step_eval_results: list[EvaluatedCase] = []
+            step_evaluation_outcomes: list[EvaluationOutcome] = []
             step_trajectories: list[Trajectory] = []
             step_cases: list[Case] = []
             step_case_count = 0
@@ -1201,9 +1512,12 @@ class SkillDocumentOptimizer(BaseOptimizer):  # type: ignore[misc]
 
                     # 1. Rollout (uses all skills — agent has all operators bound)
                     rollout_started = time.perf_counter()
-                    batch_evaluated, batch_trajectories = await self._rollout(
+                    self._last_training_batch = None
+                    batch_evaluated, rollout_trajectories = await self._rollout(
                         cases=batch_cases,
                     )
+                    if self._last_training_batch is not None:
+                        step_evaluation_outcomes.extend(self._last_training_batch.outcomes)
                     logger.info(
                         "[timing] train.rollout epoch=%d step=%d accumulation=%d "
                         "cases=%d num_parallel=%d elapsed=%.3fs",
@@ -1214,13 +1528,30 @@ class SkillDocumentOptimizer(BaseOptimizer):  # type: ignore[misc]
                         self._num_parallel,
                         time.perf_counter() - rollout_started,
                     )
-                    step_eval_results.extend(batch_evaluated)
-                    step_trajectories.extend(batch_trajectories)
-                    step_cases.extend(batch_cases)
+                    trajectories_by_case_id = {
+                        case.case_id: trajectory
+                        for case, trajectory in zip(batch_cases, rollout_trajectories)
+                    }
+                    cases_by_id = {case.case_id: case for case in batch_cases}
+                    batch_data = []
+                    for eval_case in batch_evaluated:
+                        evaluated_case_id = eval_case.case.case_id
+                        case = cases_by_id.get(evaluated_case_id)
+                        trajectory = trajectories_by_case_id.get(evaluated_case_id)
+                        if case is None or trajectory is None:
+                            logger.warning(
+                                "[skill_doc_opt] evaluation identity missing case=%s",
+                                evaluated_case_id,
+                            )
+                            continue
+                        batch_data.append((trajectory, eval_case, case))
+
+                    step_eval_results.extend(item[1] for item in batch_data)
+                    step_trajectories.extend(item[0] for item in batch_data)
+                    step_cases.extend(item[2] for item in batch_data)
                     step_case_count += len(batch_cases)
 
                     # 2. Split failures/successes
-                    batch_data = list(zip(batch_trajectories, batch_evaluated, batch_cases))
                     failure_batch = [
                         item for item in batch_data if item[1].score < self._score_threshold
                     ]
@@ -1254,7 +1585,7 @@ class SkillDocumentOptimizer(BaseOptimizer):  # type: ignore[misc]
 
                     # Track comparison pairs for slow_update (last step only)
                     if step == self._steps_per_epoch - 1:
-                        for case, eval_case in zip(batch_cases, batch_evaluated):
+                        for _trajectory, eval_case, case in batch_data:
                             self._curr_epoch_comparison.append(
                                 {
                                     "case_id": case.case_id,
@@ -1288,6 +1619,7 @@ class SkillDocumentOptimizer(BaseOptimizer):  # type: ignore[misc]
                 step,
                 step_eval_results,
                 step_cases,
+                outcomes=step_evaluation_outcomes or None,
             )
             self._artifact_exporter.export_raw_patches(
                 artifact_epoch,
@@ -1612,8 +1944,16 @@ class SkillDocumentOptimizer(BaseOptimizer):  # type: ignore[misc]
 
     # ── Epoch-level: run_epoch_end ───────────────────────────────────────
 
+    def export_validation_failure(self, failure: ValidationCoverageFailureInput) -> None:
+        """Export fail-closed diagnostics at the optimizer-owned artifact epoch."""
+        artifact_epoch = getattr(self, "_artifact_epoch", -1)
+        self._artifact_exporter.export_validation_failure(artifact_epoch, failure)
+
     async def run_epoch_end(
-        self, epoch: int, val_results: list[EvaluatedCase] | None = None
+        self,
+        trainer_epoch: int,
+        val_results: list[EvaluatedCase] | None = None,
+        artifact_input: GateEpochArtifactInput | None = None,
     ) -> None:
         """Called by SkillDocumentCallbacks.on_train_epoch_end().
 
@@ -1624,20 +1964,32 @@ class SkillDocumentOptimizer(BaseOptimizer):  # type: ignore[misc]
         if self._operators:
             self._current_skill_by_operator = self._read_skills_from_operators()
             self._current_skill_content = next(iter(self._current_skill_by_operator.values()), "")
-        selected_score = self._mean_eval_score(val_results or [])
-        decision = self._infer_gate_decision()
-        base_score = selected_score if decision == "base" else None
-        candidate_score = selected_score if decision == "candidate" else None
-        self._artifact_exporter.export_gate_result(
-            epoch,
-            base_score=base_score,
-            candidate_score=candidate_score,
-            decision=decision,
-        )
+        artifact_epoch = getattr(self, "_artifact_epoch", -1)
+        if artifact_input is not None:
+            self._artifact_exporter.export_gate_result(
+                artifact_epoch,
+                gate=artifact_input.gate,
+                selected_batch=artifact_input.selected_batch,
+            )
+            self._artifact_exporter.export_validation(
+                artifact_epoch,
+                artifact_input.selected_batch,
+                artifact_input.gate,
+            )
+        else:
+            # Direct unit-level calls without a Trainer gate retain diagnostics only.
+            selected_score = self._mean_eval_score(val_results or [])
+            decision = self._infer_gate_decision()
+            self._artifact_exporter.export_gate_result(
+                artifact_epoch,
+                base_score=selected_score if decision == "base" else None,
+                candidate_score=selected_score if decision == "candidate" else None,
+                decision=decision,
+            )
 
         # A7: 计算一次 comparison_text，复用给 slow_update + meta_skill（原各调一次）。
         comparison_text = ""
-        if epoch >= 1 and (self._use_slow_update or self._use_meta_skill):
+        if trainer_epoch >= 1 and (self._use_slow_update or self._use_meta_skill):
             from evo_agent.optimizer.skill_document.slow_update import (
                 build_comparison_text,
             )
@@ -1647,20 +1999,20 @@ class SkillDocumentOptimizer(BaseOptimizer):  # type: ignore[misc]
                 self._curr_epoch_comparison,
             )
 
-        if self._use_slow_update and epoch >= 1:
+        if self._use_slow_update and trainer_epoch >= 1:
             slow_update_started = time.perf_counter()
-            await self._run_slow_update(epoch, comparison_text)
+            await self._run_slow_update(trainer_epoch, comparison_text)
             logger.info(
                 "[timing] epoch_end.slow_update epoch=%d elapsed=%.3fs",
-                epoch,
+                trainer_epoch,
                 time.perf_counter() - slow_update_started,
             )
-        if self._use_meta_skill and epoch >= 1:
+        if self._use_meta_skill and trainer_epoch >= 1:
             meta_skill_started = time.perf_counter()
-            await self._run_meta_skill(epoch, comparison_text)
+            await self._run_meta_skill(trainer_epoch, comparison_text)
             logger.info(
                 "[timing] epoch_end.meta_skill epoch=%d elapsed=%.3fs",
-                epoch,
+                trainer_epoch,
                 time.perf_counter() - meta_skill_started,
             )
         self._prev_epoch_skill = self._current_skill_content
@@ -1670,7 +2022,7 @@ class SkillDocumentOptimizer(BaseOptimizer):  # type: ignore[misc]
         self._step_buffer.clear()
         logger.info(
             "[timing] epoch_end.total epoch=%d elapsed=%.3fs",
-            epoch,
+            trainer_epoch,
             time.perf_counter() - epoch_end_started,
         )
 

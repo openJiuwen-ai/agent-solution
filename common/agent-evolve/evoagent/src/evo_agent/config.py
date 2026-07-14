@@ -38,6 +38,19 @@ class EvolveConfig(BaseSettings):
     icbc_user_id: str = ""  # EVO_ICBC_USER_ID（固定值）
     icbc_endpoint: str = ""  # EVO_ICBC_ENDPOINT（chat/completions URL）
     icbc_timeout: float = 120.0  # EVO_ICBC_TIMEOUT，流式 read 超时（秒）
+    icbc_context_window_tokens: int | None = None
+    icbc_output_reserve_tokens: int = 2048
+    icbc_chars_per_token: float = 2.0
+    icbc_completion_signal: Literal["done", "eof", "either"] = "done"
+
+    # Local prompt/output planning applies to every provider and stage.
+    llm_context_window_tokens: int = 32768
+    llm_output_reserve_tokens: int = 2048
+    llm_safety_margin_tokens: int = 512
+    llm_chars_per_token: float = 2.0
+    llm_stage_output_reserve_tokens: dict[str, int] = Field(
+        default_factory=lambda: {"evaluator": 1200, "reflect": 3000}
+    )
 
     # ── 远程通信（AdapterClient 使用） ──
     remote_timeout: float = 300.0
@@ -60,6 +73,9 @@ class EvolveConfig(BaseSettings):
     preserve_frontmatter: bool = True
     score_threshold: float = 0.5
     parallelism: int = 4
+    validation_max_case_attempts: int = 2
+    validation_min_success_ratio: float = 1.0
+    validation_require_same_case_set: bool = True
 
     # ── 路径 ──
     workspace_root: Path = Path("./workspace")
@@ -117,7 +133,12 @@ class EvolveConfig(BaseSettings):
             object.__setattr__(self, "llm_provider", "ICBC")
             missing = [
                 name
-                for name in ("icbc_token", "icbc_user_id", "icbc_endpoint")
+                for name in (
+                    "icbc_token",
+                    "icbc_user_id",
+                    "icbc_endpoint",
+                    "icbc_context_window_tokens",
+                )
                 if not getattr(self, name)
             ]
             if missing:

@@ -134,9 +134,25 @@ class TestEvolveConfig:
             icbc_token="t",
             icbc_user_id="u",
             icbc_endpoint="http://icbc/mlpmodelservice/aigc/chat/completions",
+            icbc_context_window_tokens=32768,
         )
         assert config.llm_provider == "ICBC"
         assert config.icbc_token == "t"
+
+    def test_icbc_mode_requires_declared_context_window(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """服务端选模型时不得猜测 OpenAI 默认上下文窗口。"""
+        monkeypatch.delenv("EVO_ICBC_CONTEXT_WINDOW_TOKENS", raising=False)
+
+        with pytest.raises(ValueError, match="icbc_context_window_tokens"):
+            EvolveConfig(
+                _env_file=None,
+                llm_provider="ICBC",
+                icbc_token="t",
+                icbc_user_id="u",
+                icbc_endpoint="http://icbc/svc.htm",
+            )
 
     def test_openai_mode_no_icbc_validation(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """OpenAI 默认模式不校验 ICBC 字段（空也通过）——行为不回归。"""
@@ -152,6 +168,7 @@ class TestEvolveConfig:
         monkeypatch.setenv("EVO_ICBC_TOKEN", "env-token")
         monkeypatch.setenv("EVO_ICBC_USER_ID", "env-user")
         monkeypatch.setenv("EVO_ICBC_ENDPOINT", "http://env-icbc/svc.htm")
+        monkeypatch.setenv("EVO_ICBC_CONTEXT_WINDOW_TOKENS", "32768")
         config = EvolveConfig()
         assert config.llm_provider == "ICBC"
         assert config.icbc_token == "env-token"
@@ -172,6 +189,7 @@ class TestEvolveConfig:
             icbc_token="t",
             icbc_user_id="u",
             icbc_endpoint="http://icbc/svc.htm",
+            icbc_context_window_tokens=32768,
         )
         assert config.llm_provider == "ICBC"
 

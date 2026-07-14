@@ -17,6 +17,7 @@ import pytest
 from openjiuwen.agent_evolving.trainer.progress import Callbacks
 
 from evo_agent.callbacks import ComposedCallbacks, SkillDocumentCallbacks, build_callbacks
+from evo_agent.errors import ArtifactConsistencyError
 
 
 def test_build_callbacks_two_steps() -> None:
@@ -51,6 +52,53 @@ def test_skill_document_callbacks_always_first() -> None:
     result = build_callbacks(optimizer, progress_callback=progress_cb)
 
     assert isinstance(result._callbacks[0], SkillDocumentCallbacks)
+
+
+def test_skill_document_callback_exports_coverage_failure_synchronously() -> None:
+    """trainer 抛原始错误前，skill callback 必须已落失败诊断。"""
+    optimizer = MagicMock()
+    callback = SkillDocumentCallbacks(optimizer)
+    failure = object()
+
+    callback.on_validation_coverage_failed(failure)
+
+    optimizer.export_validation_failure.assert_called_once_with(failure)
+
+
+def test_missing_gate_input_is_fatal_through_composed_callbacks() -> None:
+    """缺失 gate FIFO 输入必须中止训练，不能被 callback 组合器吞掉。"""
+    optimizer = MagicMock()
+    callbacks = ComposedCallbacks(SkillDocumentCallbacks(optimizer))
+    progress = MagicMock(current_epoch=1)
+
+    with pytest.raises(ArtifactConsistencyError, match="missing_gate_input"):
+        callbacks.on_train_epoch_end(MagicMock(), progress, [])  # type: ignore[arg-type]
+
+
+def test_gate_case_set_mismatch_is_fatal() -> None:
+    optimizer = MagicMock()
+    optimizer._artifact_epoch = 0
+    callback = SkillDocumentCallbacks(optimizer)
+    callback.on_gate_artifact_ready(
+        MagicMock(selected_batch=MagicMock(outcomes=[MagicMock(case_id="expected")]))
+    )
+    progress = MagicMock(current_epoch=1)
+    eval_info = [MagicMock(case=MagicMock(case_id="actual"))]
+
+    with pytest.raises(ArtifactConsistencyError, match="validation_case_set_mismatch"):
+        callback.on_train_epoch_end(MagicMock(), progress, eval_info)  # type: ignore[arg-type]
+
+
+def test_gate_epoch_mismatch_is_fatal() -> None:
+    optimizer = MagicMock()
+    optimizer._artifact_epoch = 0
+    callback = SkillDocumentCallbacks(optimizer)
+    callback.on_gate_artifact_ready(MagicMock())
+
+    with pytest.raises(ArtifactConsistencyError, match="epoch_mismatch"):
+        callback.on_train_epoch_end(  # type: ignore[arg-type]
+            MagicMock(), MagicMock(current_epoch=2), []
+        )
 
 
 def test_build_callbacks_no_skill_sync_param() -> None:

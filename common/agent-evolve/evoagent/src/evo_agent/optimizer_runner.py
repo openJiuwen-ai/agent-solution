@@ -41,6 +41,7 @@ from evo_agent.config import EvolveConfig
 from evo_agent.conversation import ConversationIdFactory
 from evo_agent.dataset.manifest import build_dataset_from_request, load_dataset_manifest
 from evo_agent.errors import ManagedDocBaselineError
+from evo_agent.llm.invocation import LLMInvocation, LLMProviderCapabilities
 from evo_agent.optimizer.concurrency import gather_with_semaphore
 from evo_agent.reporter.formatter import ReportFormatter
 from evo_agent.runtime_config import OptimizationConfigResolver
@@ -463,6 +464,36 @@ async def run_optimization(
 
         # 5. 构建 LLM
         llm = _create_llm(config)
+        context_window_tokens = (
+            config.icbc_context_window_tokens
+            if config.llm_provider == "ICBC"
+            else resolved.llm_context_window_tokens
+        )
+        if context_window_tokens is None:
+            raise ValueError("ICBC context window must be explicitly configured")
+        llm_invocation = LLMInvocation(
+            llm,
+            capabilities=LLMProviderCapabilities(
+                context_window_tokens=context_window_tokens,
+                supports_max_output_tokens=config.llm_provider != "ICBC",
+                supports_finish_reason=config.llm_provider != "ICBC",
+                supports_usage=config.llm_provider != "ICBC",
+                supports_json_mode=config.llm_provider != "ICBC",
+                completion_signal=(
+                    config.icbc_completion_signal if config.llm_provider == "ICBC" else "either"
+                ),
+            ),
+            parallelism=resolved.parallelism,
+            safety_margin_tokens=resolved.llm_safety_margin_tokens,
+            chars_per_token=(
+                config.icbc_chars_per_token
+                if config.llm_provider == "ICBC"
+                else resolved.llm_chars_per_token
+            ),
+            default_output_reserve_tokens=resolved.llm_output_reserve_tokens,
+            stage_output_reserve_tokens=resolved.llm_stage_output_reserve_tokens,
+        )
+        _bind_evaluator_invocation(dataset.evaluator, llm_invocation)
 
         # 6. 构建依赖（run_artifact_dir 在进入 AdapterClient 前按模式计算：
         # managed-doc 用 canonical id 作目录名，Skill 用 run_id）。
@@ -470,6 +501,7 @@ async def run_optimization(
             "agent": remote_agent,
             "evaluator": dataset.evaluator,
             "llm": llm,
+            "llm_invocation": llm_invocation,
             "model": config.optimizer_model,
             "train_cases": dataset.train_cases,
             **resolved.optimizer_runtime_dependencies(),
@@ -506,6 +538,9 @@ async def run_optimization(
             trace_max_retries=resolved.trace_max_retries,
             trace_retry_backoff=resolved.trace_retry_backoff,
             tie_reval_eps=resolved.tie_reval_eps,
+            validation_max_case_attempts=resolved.validation_max_case_attempts,
+            validation_min_success_ratio=resolved.validation_min_success_ratio,
+            validation_require_same_case_set=resolved.validation_require_same_case_set,
             early_stop_score=1.01,  # prevent early stop at perfect 1.0
         )
 
@@ -589,9 +624,6 @@ async def run_optimization(
                         "managed-doc diagnostics refresh failed; keeping job-start snapshot",
                         exc_info=True,
                     )
-
-        # 9.5 回填 gate_result.json 中缺失的 base/candidate 分数
-        _rewrite_gate_results(run_artifact_dir, trainer.gate_epoch_scores)
 
         # 10. 汇总 artifact
         # 报告趋势图用候选 fresh eval 分数（每轮真实评估，会波动）；门控赢家
@@ -688,6 +720,20 @@ def _create_llm(config: EvolveConfig) -> Model:
     return Model(client_config, model_config)
 
 
+def _bind_evaluator_invocation(evaluator: Any, invocation: LLMInvocation) -> None:
+    """Bind the run-scoped invocation through evaluator decorators."""
+    current = evaluator
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        attributes = vars(current)
+        if "_invocation" in attributes or hasattr(type(current), "_invocation"):
+            current._invocation = invocation
+        # ``getattr(MagicMock, name)`` manufactures an endless chain of child
+        # mocks.  A decorator link is valid only when the object really stores it.
+        current = attributes.get("_delegate")
+
+
 def _build_model_client_config(config: EvolveConfig) -> ModelClientConfig:
     """按 ``llm_provider`` 分派 LLM client 配置（评估器与优化器共用）。
 
@@ -706,6 +752,10 @@ def _build_model_client_config(config: EvolveConfig) -> ModelClientConfig:
             user_id=config.icbc_user_id,  # extra: allow
             verify_ssl=False,  # ICBC 内网 http
             timeout=config.icbc_timeout,  # 流式 read 超时
+            context_window_tokens=config.icbc_context_window_tokens,
+            output_reserve_tokens=config.icbc_output_reserve_tokens,
+            chars_per_token=config.icbc_chars_per_token,
+            completion_signal=config.icbc_completion_signal,
         )
     return ModelClientConfig(
         client_provider="OpenAI",
@@ -713,40 +763,3 @@ def _build_model_client_config(config: EvolveConfig) -> ModelClientConfig:
         api_base=config.llm_base_url,
         verify_ssl=False,
     )
-
-
-def _rewrite_gate_results(
-    artifact_dir: Path,
-    gate_scores: list[dict[str, float]],
-) -> None:
-    """Rewrite gate_result.json files with both base and candidate scores.
-
-    The upstream optimizer only records the winner's score in gate_result.json,
-    leaving the loser as ``null``. This post-processing step fills in both
-    scores from EvoTrainer's captured gate data and computes ``improvement``.
-
-    Parameters
-    ----------
-    artifact_dir:
-        Run-level artifact directory (e.g. ``artifacts/abc123``).
-    gate_scores:
-        Per-epoch scores from ``EvoTrainer.gate_epoch_scores``.
-        Index ``i`` → Trainer epoch ``i+1`` → ``epoch_{i+1}/gate_result.json``.
-    """
-    for i, scores in enumerate(gate_scores):
-        trainer_epoch = i + 1
-        gate_path = artifact_dir / f"epoch_{trainer_epoch}" / "gate_result.json"
-        if not gate_path.exists():
-            continue
-
-        with gate_path.open(encoding="utf-8") as f:
-            data = json.load(f)
-
-        data["base_score"] = scores["base_score"]
-        data["candidate_score"] = scores["candidate_score"]
-        data["improvement"] = scores["candidate_score"] - scores["base_score"]
-
-        gate_path.write_text(
-            json.dumps(data, indent=2, ensure_ascii=False, default=str),
-            encoding="utf-8",
-        )

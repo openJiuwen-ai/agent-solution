@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-import asyncio
 import concurrent.futures
+import hashlib
 import json
 import logging
 import math
 import os
-import re
+from collections.abc import Mapping
+from dataclasses import asdict
 from typing import Any
 
 from openjiuwen.agent_evolving.dataset import Case, EvaluatedCase
@@ -21,9 +22,18 @@ from openjiuwen.core.foundation.llm import (
 )
 
 from evo_agent.evaluator.adapters.openjiuwen import CONVERSATION_PREDICTION
+from evo_agent.evaluator.batch_result import (
+    EvaluationBatchResult,
+    EvaluationFailure,
+    EvaluationOutcome,
+)
 from evo_agent.evaluator.domain.models import LLMEvaluationOutput
 from evo_agent.evaluator.domain.scoring import EvaluationError, EvaluationScores
 from evo_agent.evaluator.evaluators.base import EvaluateInputMixin
+from evo_agent.evaluator.json_util import (
+    JsonRepairPolicy,
+    extract_json,
+)
 from evo_agent.evaluator.prompts.formatter import (
     build_dimension_keys,
     format_evaluation_prompt,
@@ -32,11 +42,36 @@ from evo_agent.evaluator.prompts.policy_v1 import (
     DEFAULT_PROMPT_TEMPLATE,
 )
 from evo_agent.evaluator.trajectory.simplify import simplify_trajectory
+from evo_agent.llm.invocation import (
+    LLMInvocation,
+    LLMInvocationContext,
+    LLMInvocationError,
+    LLMInvocationRequest,
+    LLMProviderCapabilities,
+    LLMRetryPolicy,
+)
+from evo_agent.llm.trajectory_compaction import (
+    TrajectoryCompactionContext,
+    TrajectoryCompactionError,
+    TrajectoryCompactionPolicy,
+    compact_trajectory,
+)
 
 logger = logging.getLogger(__name__)
 
 # Dimension keys for best-effort per_metric extraction.
 _DIM_KEYS = build_dimension_keys()
+_EVALUATOR_JSON_KEYS = frozenset(
+    {
+        "task_completion",
+        "trajectory_quality",
+        "safety",
+        "is_pass",
+        "score",
+        "attributed_skill",
+        "reason",
+    }
+)
 
 
 class LLMEvaluator(EvaluateInputMixin, BaseEvaluator):  # type: ignore[misc]
@@ -58,10 +93,26 @@ class LLMEvaluator(EvaluateInputMixin, BaseEvaluator):  # type: ignore[misc]
         model_client_config: ModelClientConfig,
         aggregate: str = "mean",  # deprecated — kept for factory compat
         prompt_template: str | None = None,
+        invocation: LLMInvocation | None = None,
     ) -> None:
         self._model = Model(model_client_config, model_config)
         self._aggregate = aggregate  # noqa: F841 — unused, retained for compat
         self._prompt_template = prompt_template
+        self._invocation = invocation or LLMInvocation(
+            self._model,
+            capabilities=LLMProviderCapabilities(
+                context_window_tokens=32768,
+                supports_max_output_tokens=False,
+                supports_finish_reason=True,
+                supports_usage=True,
+                supports_json_mode=True,
+                completion_signal="either",
+            ),
+            parallelism=4,
+            safety_margin_tokens=512,
+            chars_per_token=2.0,
+            default_output_reserve_tokens=1200,
+        )
 
     def evaluate(
         self,
@@ -75,7 +126,11 @@ class LLMEvaluator(EvaluateInputMixin, BaseEvaluator):  # type: ignore[misc]
         ``enable_attribution=False`` 时 prompt 不要求 skill 归因，输出也不含
         ``attributed_skill`` 字段（validation 路径，归因仅在训练 bad case 做）。
         """
-        del predict
+        if isinstance(predict, dict) and predict.get("error"):
+            raise EvaluationError(
+                category="rollout_error",
+                safe_message=f"Rollout failed for case {case.case_id}",
+            )
         label = case.label.get("expected_result")
         question = case.inputs
 
@@ -90,12 +145,9 @@ class LLMEvaluator(EvaluateInputMixin, BaseEvaluator):  # type: ignore[misc]
             msgs = trajectory_data.get("messages", [])
             if not msgs:
                 raise EvaluationError(
-                    f"Empty trajectory for case {case.case_id}: "
-                    "no messages to evaluate (trace likely unavailable)"
+                    category="trace_unavailable",
+                    safe_message=f"Trace unavailable for case {case.case_id}",
                 )
-
-        trajectory_str, _warnings = _simplify_for_prompt(trajectory_data)
-        # Warnings are dropped — the new prompt template has no warnings placeholder.
 
         # skill_names is required for attribution validation.
         skill_names = question.get("skill_names")
@@ -105,6 +157,30 @@ class LLMEvaluator(EvaluateInputMixin, BaseEvaluator):  # type: ignore[misc]
         expected_str = None
         if label is not None:
             expected_str = json.dumps(label, ensure_ascii=False, default=str)
+
+        prompt_without_trajectory = self._build_prompt(
+            expected_result=expected_str,
+            trajectory="",
+            skill_names=skill_names,
+            enable_attribution=enable_attribution,
+        )
+        trajectory_budget = self._invocation.input_token_budget("evaluator", 1200)
+        trajectory_budget -= self._invocation.estimate_messages(
+            (UserMessage(content=prompt_without_trajectory),)
+        )
+        try:
+            compacted = compact_trajectory(
+                trajectory_data,
+                policy=TrajectoryCompactionPolicy(stage="evaluator"),
+                context=TrajectoryCompactionContext(),
+                token_budget=trajectory_budget,
+            )
+        except TrajectoryCompactionError as exc:
+            raise EvaluationError(
+                category="prompt_budget_exceeded",
+                safe_message=f"Evaluator trajectory cannot fit prompt budget: {exc}",
+            ) from exc
+        trajectory_str = compacted.text
 
         prompt = self._build_prompt(
             expected_result=expected_str,
@@ -130,13 +206,67 @@ class LLMEvaluator(EvaluateInputMixin, BaseEvaluator):  # type: ignore[misc]
                 "✅" if "{diagnostic_rules}" not in prompt else "❌",
             )
 
-        try:
-            messages = [UserMessage(content=prompt)]
-            response = _run_coroutine(self._model.invoke(messages)).content
-        except Exception as e:
-            raise EvaluationError(f"LLM evaluation failed for case {case.case_id}: {e}") from e
+        invalid_error: EvaluationError | None = None
+        invalid_response: str | None = None
 
-        scores = self._parse_result(response)
+        def _result_is_valid(text: str) -> bool:
+            nonlocal invalid_error, invalid_response
+            try:
+                parsed = self._parse_result(
+                    text,
+                    enable_attribution=enable_attribution,
+                )
+                _validate_attributed_skill(parsed.attributed_skill, skill_names)
+            except EvaluationError as error:
+                invalid_error = error
+                invalid_response = text
+                return False
+            return True
+
+        retry_prompt = _build_format_retry_prompt(prompt, enable_attribution)
+        try:
+            result = self._invocation.invoke_sync(
+                LLMInvocationRequest(
+                    stage="evaluator",
+                    messages=(UserMessage(content=prompt),),
+                    retry_messages=(UserMessage(content=retry_prompt),),
+                    result_validator=_result_is_valid,
+                    context=LLMInvocationContext(run_id="evaluator", case_id=case.case_id),
+                    retry_policy=LLMRetryPolicy(2, 120.0, 300.0, 1.0, 0.0),
+                    output_schema_name="llm_evaluation",
+                    reserved_output_tokens=1200,
+                )
+            )
+            response = result.text
+        except Exception as e:
+            if (
+                isinstance(e, LLMInvocationError)
+                and e.category == "unusable_response"
+                and invalid_error is not None
+                and invalid_response is not None
+                and e.result is not None
+            ):
+                _attach_invocation_diagnostics(
+                    invalid_error,
+                    response=invalid_response,
+                    result=e.result,
+                )
+                _log_evaluation_error(invalid_error, case_id=case.case_id)
+                raise invalid_error from e
+            category = getattr(e, "category", "llm_invoke_error")
+            raise EvaluationError(
+                category=category,
+                safe_message=f"LLM evaluation failed for case {case.case_id}: {e}",
+            ) from e
+
+        try:
+            scores = self._parse_result(response, enable_attribution=enable_attribution)
+        except EvaluationError as error:
+            _attach_invocation_diagnostics(error, response=response, result=result)
+            _log_evaluation_error(error, case_id=case.case_id)
+            raise
+        if scores.repaired:
+            _log_json_repair(scores, response=response, result=result, case_id=case.case_id)
 
         # Validate attributed_skill against the provided skill_names list.
         _validate_attributed_skill(scores.attributed_skill, skill_names)
@@ -163,13 +293,31 @@ class LLMEvaluator(EvaluateInputMixin, BaseEvaluator):  # type: ignore[misc]
 
         Failed cases are logged at WARNING level with their case_id and error.
         """
+        return list(
+            self.batch_evaluate_detailed(
+                cases,
+                predicts,
+                num_parallel=num_parallel,
+                enable_attribution=enable_attribution,
+            ).successes
+        )
+
+    def batch_evaluate_detailed(
+        self,
+        cases: list[Case] | Any,
+        predicts: list[dict[str, Any]],
+        num_parallel: int = 1,
+        *,
+        enable_attribution: bool = True,
+    ) -> EvaluationBatchResult:
+        """Evaluate every input into an ordered success-or-failure outcome."""
         if len(cases) != len(predicts):
             raise ValueError(
                 f"length of cases: {len(cases)} does not equal length of predicts: {len(predicts)}"
             )
 
         if not cases:
-            return []
+            return EvaluationBatchResult(())
 
         num_workers = min(max(num_parallel, 1), len(cases))
 
@@ -181,14 +329,43 @@ class LLMEvaluator(EvaluateInputMixin, BaseEvaluator):  # type: ignore[misc]
                 executor.submit(_eval, case, predict) for case, predict in zip(cases, predicts)
             ]
 
-            evaluated: list[EvaluatedCase] = []
-            for future, case, _predict in zip(futures, cases, predicts):
+            outcomes: list[EvaluationOutcome] = []
+            for index, (future, case, _predict) in enumerate(zip(futures, cases, predicts)):
+                trajectory = (
+                    case.inputs.get("trajectory") if isinstance(case.inputs, dict) else None
+                )
                 try:
-                    evaluated.append(future.result())
+                    evaluated = future.result()
+                    outcomes.append(
+                        EvaluationOutcome(
+                            index=index,
+                            case_id=case.case_id,
+                            case=case,
+                            trajectory=trajectory,
+                            evaluated=evaluated,
+                            failure=None,
+                        )
+                    )
                 except EvaluationError as e:
-                    logger.warning("Evaluation skipped for case %s: %s", case.case_id, e)
+                    _log_evaluation_error(e, case_id=case.case_id)
+                    outcomes.append(
+                        EvaluationOutcome(
+                            index=index,
+                            case_id=case.case_id,
+                            case=case,
+                            trajectory=trajectory,
+                            evaluated=None,
+                            failure=EvaluationFailure(
+                                category=e.category,
+                                safe_message=e.safe_message,
+                                invocation_id=e.invocation_id,
+                                response_sha256=e.response_sha256,
+                                response_chars=e.response_chars,
+                            ),
+                        )
+                    )
 
-        return evaluated
+        return EvaluationBatchResult(tuple(outcomes))
 
     @staticmethod
     def _mean_score(evaluated: list[EvaluatedCase]) -> float:
@@ -257,13 +434,16 @@ class LLMEvaluator(EvaluateInputMixin, BaseEvaluator):  # type: ignore[misc]
                 "reason": scores.reason,
                 "is_pass": scores.is_pass,
                 "attributed_skill": scores.attributed_skill,
+                "repaired": scores.repaired,
+                "parse_mode": scores.parse_mode,
+                "repair_operations": list(scores.repair_operations),
             },
             ensure_ascii=False,
         )
 
         return evaluated
 
-    def _parse_result(self, response: str) -> EvaluationScores:
+    def _parse_result(self, response: str, *, enable_attribution: bool = False) -> EvaluationScores:
         """Parse LLM flat-output JSON into EvaluationScores.
 
         Validates 4 essential fields: ``is_pass``, ``score``, ``attributed_skill`,
@@ -275,13 +455,26 @@ class LLMEvaluator(EvaluateInputMixin, BaseEvaluator):  # type: ignore[misc]
             EvaluationError: when JSON extraction fails, the response is not
                 a dict, or essential fields are missing/invalid.
         """
-        try:
-            data = _extract_json(response)
-        except Exception as e:
-            raise EvaluationError(f"Failed to extract JSON from LLM response: {e}") from e
-
+        extraction = extract_json(
+            response,
+            policy=JsonRepairPolicy(
+                allow_single_missing_comma=True,
+                allowed_comma_next_keys=_EVALUATOR_JSON_KEYS,
+                required_keys=frozenset(
+                    {"reason", "attributed_skill"} if enable_attribution else {"reason"}
+                ),
+            ),
+        )
+        data = extraction.data
         if not isinstance(data, dict):
-            raise EvaluationError(f"Failed to extract JSON from LLM response: {response[:200]}")
+            digest = hashlib.sha256(response.encode("utf-8")).hexdigest()
+            raise EvaluationError(
+                category="json_parse_error",
+                safe_message=f"Failed to extract JSON from evaluator response: {extraction.error}",
+                response_sha256=digest,
+                response_chars=len(response),
+                raw_response=response,
+            )
 
         # --- Essential field validation (critical path) ---
         raw_score = data.get("score")
@@ -326,6 +519,12 @@ class LLMEvaluator(EvaluateInputMixin, BaseEvaluator):  # type: ignore[misc]
             is_pass=is_pass,
             score=score,
             attributed_skill=attributed_skill,
+            repaired=extraction.parse_mode not in {"exact", "failed"},
+            parse_mode=extraction.parse_mode,
+            repair_operations=tuple(
+                asdict(operation) for operation in extraction.repair_operations
+            ),
+            repaired_response=extraction.repaired_text,
         )
 
 
@@ -363,33 +562,85 @@ def _simplify_for_prompt(
     )
 
 
-def _run_coroutine(coroutine: Any) -> Any:
-    """Run a coroutine synchronously; uses a thread when a loop is already running."""
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return asyncio.run(coroutine)
+def _build_format_retry_prompt(prompt: str, enable_attribution: bool) -> str:
+    required = "is_pass、score、reason"
+    if enable_attribution:
+        required += "、attributed_skill"
+    return (
+        f"{prompt}\n\n格式重试：上一次输出未通过 JSON schema 校验。"
+        f"请重新评估，并只输出一个合法 JSON 对象；必填字段：{required}。"
+        "禁止 Markdown、code fence、注释、NaN 或 Infinity。"
+    )
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-        return executor.submit(asyncio.run, coroutine).result()
+
+def _log_evaluation_error(error: EvaluationError, *, case_id: str) -> None:
+    if error.logged:
+        return
+    raw = (
+        json.dumps(error.raw_response, ensure_ascii=False)
+        if error.raw_response is not None
+        else "unknown"
+    )
+    diagnostics = error.invocation_diagnostics
+    logger.warning(
+        "Evaluation skipped case_id=%s category=%s invocation_id=%s stage=%s "
+        "provider=%s prompt_estimated_tokens=%s output_reserve_tokens=%s "
+        "compacted=%s finish_reason=%s completion_signal=%s chunk_count=%s "
+        "raw_response=%s",
+        case_id,
+        error.category,
+        error.invocation_id or "unknown",
+        diagnostics.get("stage", "unknown"),
+        diagnostics.get("provider", "unknown"),
+        diagnostics.get("estimated_input_tokens", "unknown"),
+        diagnostics.get("output_reserve_tokens", "unknown"),
+        diagnostics.get("compacted", "unknown"),
+        diagnostics.get("finish_reason", "unknown"),
+        diagnostics.get("completion_signal", "unknown"),
+        diagnostics.get("chunk_count", "unknown"),
+        raw,
+    )
+    error.logged = True
 
 
-def _extract_json(text: str) -> dict[str, Any] | None:
-    """Extract JSON from an LLM response.
+def _attach_invocation_diagnostics(
+    error: EvaluationError,
+    *,
+    response: str,
+    result: Any,
+) -> None:
+    """Attach log-only evidence without changing the artifact-safe exception string."""
+    error.raw_response = response
+    error.response_sha256 = hashlib.sha256(response.encode("utf-8")).hexdigest()
+    error.response_chars = len(response)
+    error.invocation_id = getattr(result, "invocation_id", None)
+    metadata = getattr(result, "metadata", {})
+    diagnostics = dict(metadata) if isinstance(metadata, Mapping) else {}
+    diagnostics["stage"] = "evaluator"
+    diagnostics["finish_reason"] = getattr(result, "finish_reason", None) or "unknown"
+    error.invocation_diagnostics = diagnostics
 
-    Tries `````json ... ``````` code blocks first, then falls back to bare JSON.
-    """
-    match = re.search(r"```json\s*(.*?)\s*```", text, re.DOTALL)
-    if match:
-        data = json.loads(match.group(1))
-        return data if isinstance(data, dict) else None
 
-    match = re.search(r"\{.*\}", text, re.DOTALL)
-    if match:
-        data = json.loads(match.group(0))
-        return data if isinstance(data, dict) else None
-
-    return None
+def _log_json_repair(
+    scores: EvaluationScores,
+    *,
+    response: str,
+    result: Any,
+    case_id: str,
+) -> None:
+    metadata = getattr(result, "metadata", {})
+    diagnostics = dict(metadata) if isinstance(metadata, Mapping) else {}
+    logger.warning(
+        "JSON repaired case_id=%s invocation_id=%s stage=evaluator provider=%s "
+        "parse_mode=%s repair_operations=%s original_response=%s repaired_response=%s",
+        case_id,
+        getattr(result, "invocation_id", None) or "unknown",
+        diagnostics.get("provider", "unknown"),
+        scores.parse_mode,
+        json.dumps(scores.repair_operations, ensure_ascii=False),
+        json.dumps(response, ensure_ascii=False),
+        json.dumps(scores.repaired_response or "", ensure_ascii=False),
+    )
 
 
 def _validate_attributed_skill(

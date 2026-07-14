@@ -23,6 +23,46 @@ class FatalOptimizationError(Exception):
     """
 
 
+class ArtifactPersistenceError(FatalOptimizationError):
+    """An artifact could not be durably and atomically published."""
+
+    def __init__(self, path: str, cause: BaseException) -> None:
+        self.path = path
+        self.cause = cause
+        super().__init__(f"artifact persistence failed: path={path} error={cause}")
+
+
+class ArtifactConsistencyError(FatalOptimizationError):
+    """Gate/validation evidence is missing or belongs to a different epoch."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(f"artifact consistency failed: reason={reason}")
+
+
+class ValidationCoverageError(FatalOptimizationError):
+    """Validation evidence is incomplete or base/candidate identities differ."""
+
+    def __init__(
+        self,
+        *,
+        attempted_count: int,
+        evaluated_count: int,
+        min_success_ratio: float,
+        reason: str,
+    ) -> None:
+        self.attempted_count = attempted_count
+        self.evaluated_count = evaluated_count
+        self.min_success_ratio = min_success_ratio
+        self.reason = reason
+        coverage = evaluated_count / attempted_count if attempted_count else 0.0
+        super().__init__(
+            "validation coverage failed: "
+            f"reason={reason} attempted={attempted_count} evaluated={evaluated_count} "
+            f"coverage={coverage:.6f} required={min_success_ratio:.6f}"
+        )
+
+
 class ManagedDocApplyError(FatalOptimizationError):
     """Apply of a managed-doc failed — abort the job, keep baseline artifact.
 

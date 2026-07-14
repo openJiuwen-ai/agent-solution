@@ -28,7 +28,7 @@ import pytest
 from evo_agent.adapter_client.client import AdapterClient, AdapterError
 from evo_agent.adapter_client.types import ManagedDocSnapshot
 from evo_agent.config import EvolveConfig
-from evo_agent.optimizer_runner import _build_operators, _rewrite_gate_results, run_optimization
+from evo_agent.optimizer_runner import _build_operators, run_optimization
 from evo_agent.types import OptimizeReport, OptimizeRequest, TrainResult, ValResult
 
 # ── Helpers ──
@@ -1067,109 +1067,6 @@ async def test_runner_hyperparams_injected_to_dependencies(
     assert captured_deps.get("temperature") == 0.7
 
 
-# ── _rewrite_gate_results ──
-
-
-def test_rewrite_gate_results_fills_both_scores(tmp_path: Path) -> None:
-    """gate_result.json with null scores → both filled, improvement computed."""
-    epoch_dir = tmp_path / "epoch_1"
-    epoch_dir.mkdir()
-    gate_path = epoch_dir / "gate_result.json"
-    gate_path.write_text(
-        json.dumps(
-            {
-                "epoch": 1,
-                "base_score": None,
-                "candidate_score": 0.525,
-                "improvement": None,
-                "decision": "candidate",
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    _rewrite_gate_results(
-        tmp_path,
-        [{"base_score": 0.375, "candidate_score": 0.525}],
-    )
-
-    result = json.loads(gate_path.read_text(encoding="utf-8"))
-    assert result["base_score"] == 0.375
-    assert result["candidate_score"] == 0.525
-    assert result["improvement"] == pytest.approx(0.15)
-    assert result["decision"] == "candidate"
-
-
-def test_rewrite_gate_results_skips_missing_dir(tmp_path: Path) -> None:
-    """No epoch directory → no error."""
-    _rewrite_gate_results(
-        tmp_path,
-        [{"base_score": 0.3, "candidate_score": 0.7}],
-    )
-    # No exception raised, no files created
-
-
-def test_rewrite_gate_results_multiple_epochs(tmp_path: Path) -> None:
-    """Multiple epochs → each gate_result.json updated independently."""
-    for epoch in (1, 2):
-        epoch_dir = tmp_path / f"epoch_{epoch}"
-        epoch_dir.mkdir()
-        gate_path = epoch_dir / "gate_result.json"
-        gate_path.write_text(
-            json.dumps(
-                {
-                    "epoch": epoch,
-                    "base_score": None,
-                    "candidate_score": None,
-                    "improvement": None,
-                    "decision": "unknown",
-                }
-            ),
-            encoding="utf-8",
-        )
-
-    _rewrite_gate_results(
-        tmp_path,
-        [
-            {"base_score": 0.3, "candidate_score": 0.7},
-            {"base_score": 0.6, "candidate_score": 0.4},
-        ],
-    )
-
-    r1 = json.loads((tmp_path / "epoch_1" / "gate_result.json").read_text())
-    assert r1["base_score"] == 0.3
-    assert r1["candidate_score"] == 0.7
-    assert r1["improvement"] == pytest.approx(0.4)
-
-    r2 = json.loads((tmp_path / "epoch_2" / "gate_result.json").read_text())
-    assert r2["base_score"] == 0.6
-    assert r2["candidate_score"] == 0.4
-    assert r2["improvement"] == pytest.approx(-0.2)
-
-
-def test_rewrite_gate_results_uses_utf8_encoding(tmp_path: Path) -> None:
-    """Chinese content in JSON → written correctly with ensure_ascii=False."""
-    epoch_dir = tmp_path / "epoch_1"
-    epoch_dir.mkdir()
-    gate_path = epoch_dir / "gate_result.json"
-    gate_path.write_text(
-        json.dumps(
-            {"epoch": 1, "base_score": None, "candidate_score": None, "decision": "base"},
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
-    )
-
-    _rewrite_gate_results(tmp_path, [{"base_score": 0.5, "candidate_score": 0.6}])
-
-    raw = gate_path.read_text(encoding="utf-8")
-    # ensure_ascii=False means Chinese chars are preserved as-is (not \uXXXX)
-    # and the scores are correctly filled
-    result = json.loads(raw)
-    assert result["base_score"] == 0.5
-    assert result["candidate_score"] == 0.6
-
-
 # ── T4: _build_model_client_config helper ──
 
 
@@ -1206,6 +1103,7 @@ class TestBuildContextModelClientConfig:
             icbc_token="the-token",
             icbc_user_id="the-user",
             icbc_endpoint="http://icbc/svc.htm",
+            icbc_context_window_tokens=32768,
         )
         cfg = _build_model_client_config(config)
         assert cfg.client_provider == "ICBC"
@@ -1227,6 +1125,7 @@ class TestBuildContextModelClientConfig:
             icbc_token="t",
             icbc_user_id="u",
             icbc_endpoint="http://icbc/svc.htm",
+            icbc_context_window_tokens=32768,
         )
         # helper 是纯函数；评估器与优化器两条路径调同一 helper → provider 一致
         cfg1 = _build_model_client_config(config)

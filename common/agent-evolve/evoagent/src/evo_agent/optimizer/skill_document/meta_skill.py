@@ -87,6 +87,7 @@ async def run_meta_skill(
             model,
             prompt,
             policy=_META_SKILL_POLICY,
+            stage="meta_skill",
         )
     except Exception:
         logger.warning("meta_skill LLM call failed", exc_info=True)

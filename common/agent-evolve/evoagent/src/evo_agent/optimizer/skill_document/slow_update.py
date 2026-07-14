@@ -166,6 +166,7 @@ async def run_slow_update(
             model,
             prompt,
             policy=_SLOW_UPDATE_POLICY,
+            stage="slow_update",
         )
     except Exception:
         logger.warning("slow_update LLM call failed", exc_info=True)

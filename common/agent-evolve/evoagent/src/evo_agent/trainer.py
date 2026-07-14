@@ -12,13 +12,20 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any
+from typing import Any, Literal
 
 from openjiuwen.agent_evolving.dataset import CaseLoader, EvaluatedCase
 from openjiuwen.agent_evolving.trainer.trainer import Trainer
 
 from evo_agent.dataset.case import merge_extra_data
+from evo_agent.errors import ValidationCoverageError
+from evo_agent.evaluator.batch_result import EvaluationBatchResult, EvaluationOutcome
 from evo_agent.evaluator.trajectory.normalize import normalize_trace_to_trajectory
+from evo_agent.optimizer.skill_document.types import (
+    GateEpochArtifactInput,
+    GateEvaluationRecord,
+    ValidationCoverageFailureInput,
+)
 from evo_agent.types import TrajectoryUnavailableError
 
 # Type aliases for _select_best_candidate_on_val override
@@ -64,6 +71,9 @@ class EvoTrainer(Trainer):  # type: ignore[misc]
         trace_max_retries: int = 3,
         trace_retry_backoff: float = 1.0,
         tie_reval_eps: float = 0.0,
+        validation_max_case_attempts: int = 2,
+        validation_min_success_ratio: float = 1.0,
+        validation_require_same_case_set: bool = True,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -76,12 +86,17 @@ class EvoTrainer(Trainer):  # type: ignore[misc]
         # 平局重 eval 阈值：|cand - base| <= eps 触发 1 次候选重 eval（均值降噪）。
         # 默认 0.0 = 仅精确平局触发；负值可禁用。
         self._tie_reval_eps = tie_reval_eps
+        self._validation_max_case_attempts = validation_max_case_attempts
+        self._validation_min_success_ratio = validation_min_success_ratio
+        self._validation_require_same_case_set = validation_require_same_case_set
 
         # Gate score capture: records {base_score, candidate_score} per epoch
         # where 2 candidates were evaluated. Index i → Trainer epoch i+1.
         self._gate_epoch_scores: list[dict[str, float]] = []
         self._cached_base_val_score: float | None = None
         self._cached_base_val_evaluated: list[EvaluatedCase] | None = None
+        self._cached_base_batch: EvaluationBatchResult | None = None
+        self._last_validation_batch: EvaluationBatchResult | None = None
 
     @property
     def gate_epoch_scores(self) -> list[dict[str, float]]:
@@ -100,6 +115,10 @@ class EvoTrainer(Trainer):  # type: ignore[misc]
         """Seed the validation gate cache with an already evaluated base state."""
         self._cached_base_val_score = score
         self._cached_base_val_evaluated = list(evaluated)
+        if self._last_validation_batch is not None and {
+            outcome.case_id for outcome in self._last_validation_batch.outcomes
+        } == {_evaluated_case_id(item) for item in evaluated}:
+            self._cached_base_batch = self._last_validation_batch
 
     def _select_best_candidate_on_val(
         self,
@@ -126,6 +145,9 @@ class EvoTrainer(Trainer):  # type: ignore[misc]
         best_state: dict[str, dict[str, Any]] | None = None
 
         scores: list[float] = []
+        evaluated_by_candidate: list[list[EvaluatedCase]] = []
+        states_by_candidate: list[dict[str, dict[str, Any]]] = []
+        batches_by_candidate: list[EvaluationBatchResult] = []
         for candidate_index, cand_updates in enumerate(candidates):
             self._restore_operators_state(operators, base_state)
             self.apply_updates(operators, cand_updates or {})
@@ -139,17 +161,43 @@ class EvoTrainer(Trainer):  # type: ignore[misc]
                 and cached_base_evaluated is not None
             )
             started = time.perf_counter()
-            if (
-                use_cached_base
-                and cached_base_score is not None
-                and cached_base_evaluated is not None
-            ):
-                cand_score = cached_base_score
-                cand_evaluated = list(cached_base_evaluated)
-            else:
-                cand_score, cand_evaluated = self.evaluate(agent, val_cases)
+            try:
+                if (
+                    use_cached_base
+                    and cached_base_score is not None
+                    and cached_base_evaluated is not None
+                ):
+                    cand_score = cached_base_score
+                    cand_evaluated = list(cached_base_evaluated)
+                else:
+                    cand_score, cand_evaluated = self.evaluate(agent, val_cases)
+            except ValidationCoverageError as error:
+                failed_batch = self._last_validation_batch or EvaluationBatchResult(())
+                self._restore_operators_state(operators, base_state)
+                if batches_by_candidate:
+                    base_batch = batches_by_candidate[0]
+                    candidate_batches = tuple(batches_by_candidate[1:] + [failed_batch])
+                else:
+                    base_batch = failed_batch
+                    candidate_batches = ()
+                self._notify_validation_coverage_failed(
+                    ValidationCoverageFailureInput(
+                        base_batch=base_batch,
+                        candidate_batches=candidate_batches,
+                        error=error,
+                    )
+                )
+                raise
             elapsed = time.perf_counter() - started
             scores.append(cand_score)
+            evaluated_by_candidate.append(cand_evaluated)
+            states_by_candidate.append(self._snapshot_operators_state(operators))
+            if use_cached_base and self._cached_base_batch is not None:
+                batches_by_candidate.append(self._cached_base_batch)
+            else:
+                batches_by_candidate.append(
+                    _matching_or_synthetic_batch(self._last_validation_batch, cand_evaluated)
+                )
             logger.info(
                 "[timing] validation.candidate index=%d source=%s cases=%d "
                 "num_parallel=%d score=%.4f elapsed=%.3fs",
@@ -172,6 +220,23 @@ class EvoTrainer(Trainer):  # type: ignore[misc]
         # (|cand - base| <= eps), re-evaluate the candidate ONCE and compare
         # the denoised mean against base — no recursion.
         if len(scores) == 2:
+            try:
+                self._require_comparable_validation(
+                    evaluated_by_candidate[0],
+                    evaluated_by_candidate[1],
+                    attempted_count=val_case_count,
+                )
+            except ValidationCoverageError as error:
+                retained_state = states_by_candidate[0] if states_by_candidate else base_state
+                self._restore_operators_state(operators, retained_state)
+                self._notify_validation_coverage_failed(
+                    ValidationCoverageFailureInput(
+                        base_batch=batches_by_candidate[0],
+                        candidate_batches=tuple(batches_by_candidate[1:]),
+                        error=error,
+                    )
+                )
+                raise
             base_score = scores[0]
             cand_score = scores[1]
             gate_payload: dict[str, Any] = {
@@ -193,6 +258,9 @@ class EvoTrainer(Trainer):  # type: ignore[misc]
                     time.perf_counter() - reval_started,
                 )
                 cand_mean = (cand_score + cand2_score) / 2
+                reval_batch = _matching_or_synthetic_batch(
+                    self._last_validation_batch, cand2_evaluated
+                )
                 gate_payload = {
                     "base_score": base_score,
                     "candidate_score": cand_mean,
@@ -205,8 +273,16 @@ class EvoTrainer(Trainer):  # type: ignore[misc]
                     best_score = cand_mean
                     best_evaluated = cand2_evaluated
                     best_state = self._snapshot_operators_state(operators)
-            # _gate_epoch_scores keeps the canonical {base, candidate} pair for
-            # _rewrite_gate_results; candidate_score is the denoised mean on tie.
+                    batches_by_candidate[1] = reval_batch
+                else:
+                    # The first candidate sample may have provisionally won.
+                    # Re-evaluation is authoritative for the gate, so restore
+                    # every selected value to the base when its mean loses.
+                    best_score = base_score
+                    best_evaluated = evaluated_by_candidate[0]
+                    best_state = states_by_candidate[0]
+            # Keep the canonical pair for reporting; candidate_score is the
+            # denoised mean when tie re-evaluation ran.
             self._gate_epoch_scores.append(
                 {
                     "base_score": base_score,
@@ -214,6 +290,27 @@ class EvoTrainer(Trainer):  # type: ignore[misc]
                 }
             )
             self._notify_gate_scored(gate_payload)
+            decision: Literal["base", "candidate"] = (
+                "candidate" if gate_payload["candidate_score"] > base_score else "base"
+            )
+            gate_record = GateEvaluationRecord(
+                base_score=base_score,
+                candidate_score=gate_payload["candidate_score"],
+                decision=decision,
+                tie_revalued=bool(gate_payload["tie_revalued"]),
+                candidate_score_first=gate_payload.get("candidate_score_first"),
+                candidate_score_reval=gate_payload.get("candidate_score_reval"),
+            )
+            selected_batch = batches_by_candidate[1 if decision == "candidate" else 0]
+            self._last_validation_batch = selected_batch
+            self._notify_gate_artifact_ready(
+                GateEpochArtifactInput(
+                    gate=gate_record,
+                    base_batch=batches_by_candidate[0],
+                    candidate_batches=tuple(batches_by_candidate[1:]),
+                    selected_batch=selected_batch,
+                )
+            )
 
         if best_state is not None:
             self._restore_operators_state(operators, best_state)
@@ -237,6 +334,50 @@ class EvoTrainer(Trainer):  # type: ignore[misc]
             notify(payload)
         except Exception:
             logger.warning("on_gate_scored callback failed", exc_info=True)
+
+    def _notify_validation_coverage_failed(self, failure: ValidationCoverageFailureInput) -> None:
+        notify = getattr(self._callbacks, "on_validation_coverage_failed", None)
+        if callable(notify):
+            try:
+                notify(failure)
+            except Exception:
+                logger.error(
+                    "validation coverage diagnostics failed; preserving original error",
+                    exc_info=True,
+                )
+
+    def _notify_gate_artifact_ready(self, artifact_input: GateEpochArtifactInput) -> None:
+        notify = getattr(self._callbacks, "on_gate_artifact_ready", None)
+        if callable(notify):
+            notify(artifact_input)
+
+    def _require_comparable_validation(
+        self,
+        base: list[EvaluatedCase],
+        candidate: list[EvaluatedCase],
+        *,
+        attempted_count: int,
+    ) -> None:
+        denominator = attempted_count or max(len(base), len(candidate))
+        for label, evaluated in (("base", base), ("candidate", candidate)):
+            coverage = len(evaluated) / denominator if denominator else 1.0
+            if coverage < self._validation_min_success_ratio:
+                raise ValidationCoverageError(
+                    attempted_count=denominator,
+                    evaluated_count=len(evaluated),
+                    min_success_ratio=self._validation_min_success_ratio,
+                    reason=f"{label}_coverage_below_minimum",
+                )
+        if self._validation_require_same_case_set:
+            base_ids = {_evaluated_case_id(item) for item in base}
+            candidate_ids = {_evaluated_case_id(item) for item in candidate}
+            if base_ids != candidate_ids:
+                raise ValidationCoverageError(
+                    attempted_count=denominator,
+                    evaluated_count=min(len(base), len(candidate)),
+                    min_success_ratio=self._validation_min_success_ratio,
+                    reason="case_set_mismatch",
+                )
 
     async def _get_required_trace(self, conversation_id: str) -> dict[str, Any]:
         """Fetch trace data with retry + backoff.
@@ -349,12 +490,33 @@ class EvoTrainer(Trainer):  # type: ignore[misc]
             predicts, eval_cases = await self._predict_and_build_eval_cases(agent, case_list)
             rollout_elapsed = time.perf_counter() - rollout_started
             eval_started = time.perf_counter()
-            evaluated = self._evaluator.batch_evaluate(
-                eval_cases,
-                predicts,
-                num_parallel=self._num_parallel,
-                enable_attribution=False,  # B2: validation 不做归因，缩小 prompt
-            )
+            detailed_evaluate = vars(self._evaluator).get("batch_evaluate_detailed")
+            if detailed_evaluate is None:
+                detailed_method = getattr(type(self._evaluator), "batch_evaluate_detailed", None)
+                if detailed_method is not None:
+                    detailed_evaluate = detailed_method.__get__(self._evaluator)
+            if callable(detailed_evaluate):
+                batch = self._evaluate_detailed_with_retries(
+                    detailed_evaluate,
+                    eval_cases,
+                    predicts,
+                )
+                self._last_validation_batch = batch
+                if batch.coverage < self._validation_min_success_ratio:
+                    raise ValidationCoverageError(
+                        attempted_count=batch.attempted_count,
+                        evaluated_count=batch.evaluated_count,
+                        min_success_ratio=self._validation_min_success_ratio,
+                        reason="validation_coverage_below_minimum",
+                    )
+                evaluated = list(batch.successes)
+            else:
+                evaluated = self._evaluator.batch_evaluate(
+                    eval_cases,
+                    predicts,
+                    num_parallel=self._num_parallel,
+                    enable_attribution=False,  # B2: validation 不做归因，缩小 prompt
+                )
             eval_elapsed = time.perf_counter() - eval_started
             # _mean_score (mean) remains the default validation score. When the
             # evaluator has batch aggregation configured (batch_score set to a
@@ -394,3 +556,67 @@ class EvoTrainer(Trainer):  # type: ignore[misc]
                 self._num_parallel,
                 time.perf_counter() - total_started,
             )
+
+    def _evaluate_detailed_with_retries(
+        self,
+        detailed_evaluate: Any,
+        eval_cases: list[Any],
+        predicts: list[dict[str, Any]],
+    ) -> EvaluationBatchResult:
+        pending_indexes = list(range(len(eval_cases)))
+        completed: dict[int, EvaluationOutcome] = {}
+        for _attempt in range(self._validation_max_case_attempts):
+            if not pending_indexes:
+                break
+            attempt_cases = [eval_cases[index] for index in pending_indexes]
+            attempt_predicts = [predicts[index] for index in pending_indexes]
+            attempt_batch = detailed_evaluate(
+                attempt_cases,
+                attempt_predicts,
+                num_parallel=self._num_parallel,
+                enable_attribution=False,
+            )
+            next_pending: list[int] = []
+            for local_outcome in attempt_batch.outcomes:
+                original_index = pending_indexes[local_outcome.index]
+                completed[original_index] = EvaluationOutcome(
+                    index=original_index,
+                    case_id=local_outcome.case_id,
+                    case=local_outcome.case,
+                    trajectory=local_outcome.trajectory,
+                    evaluated=local_outcome.evaluated,
+                    failure=local_outcome.failure,
+                )
+                if local_outcome.evaluated is None:
+                    next_pending.append(original_index)
+            pending_indexes = next_pending
+        return EvaluationBatchResult(tuple(completed[index] for index in sorted(completed)))
+
+
+def _evaluated_case_id(evaluated: EvaluatedCase) -> str:
+    case = getattr(evaluated, "case", None)
+    return str(getattr(case, "case_id", getattr(evaluated, "case_id", "")))
+
+
+def _matching_or_synthetic_batch(
+    batch: EvaluationBatchResult | None,
+    evaluated: list[EvaluatedCase],
+) -> EvaluationBatchResult:
+    ids = {_evaluated_case_id(item) for item in evaluated}
+    if batch is not None and {outcome.case_id for outcome in batch.outcomes} == ids:
+        return batch
+    outcomes = []
+    for index, item in enumerate(evaluated):
+        case = item.case
+        trajectory = case.inputs.get("trajectory", {"messages": []})
+        outcomes.append(
+            EvaluationOutcome(
+                index=index,
+                case_id=case.case_id,
+                case=case,
+                trajectory=trajectory,
+                evaluated=item,
+                failure=None,
+            )
+        )
+    return EvaluationBatchResult(tuple(outcomes))

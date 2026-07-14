@@ -156,7 +156,12 @@ def test_read_file_tool_result_is_truncated() -> None:
     prompt = mock_invoke.await_args.args[0][0].content
     assert "read_file" in prompt
     assert len(prompt) < len(long_skill)
-    assert "…" in prompt
+    assert "TOOL_RESULT_TRUNCATED" in prompt
+    trajectory = json.loads(prompt.split("轨迹：\n", 1)[1])
+    assert (
+        trajectory["messages"][0]["tool_calls"][0]["function"]["arguments"]
+        == '{"path": "/skills/fund_planning_skill/SKILL.md"}'
+    )
 
 
 def test_empty_trajectory_raises_evaluation_error() -> None:

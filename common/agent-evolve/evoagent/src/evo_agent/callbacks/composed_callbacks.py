@@ -111,3 +111,21 @@ class ComposedCallbacks(Callbacks):  # type: ignore[misc]
             if not callable(handler):
                 continue
             self._invoke(cb, lambda: handler(payload), "on_gate_scored")
+
+    def on_gate_artifact_ready(self, artifact_input: Any) -> None:
+        """Forward the complete gate/validation artifact input."""
+        for cb in self._callbacks:
+            handler = getattr(cb, "on_gate_artifact_ready", None)
+            if callable(handler):
+                self._invoke(cb, lambda: handler(artifact_input), "on_gate_artifact_ready")
+
+    def on_validation_coverage_failed(self, error: Any) -> None:
+        """Export diagnostics synchronously before the trainer re-raises coverage failure."""
+        for cb in self._callbacks:
+            handler = getattr(cb, "on_validation_coverage_failed", None)
+            if callable(handler):
+                self._invoke(
+                    cb,
+                    lambda: handler(error),
+                    "on_validation_coverage_failed",
+                )

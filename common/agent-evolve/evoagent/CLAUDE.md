@@ -42,7 +42,7 @@ make test-unit  # 仅单元测试
 - agent-core (`openjiuwen` 包): ReActAgent, SkillManager
 - agent_evolving (`openjiuwen` 包): SkillDocumentOptimizer, Trainer, SingleDimUpdater, Callbacks
 - 合入方案: `docs/skeleton-design.md`
-- 架构决策: `docs/adr/0001-adapter-layer-in-evoagent.md`, `docs/adr/0002-scenario-folder-api-multi-skill.md`, `docs/adr/0003-adapter-sidecar-platform-integration-sse.md`, `docs/adr/0004-evaluator-optimizer-integration.md`, `docs/adr/0005-platform-template-driven-api.md`, `docs/adr/0006-skill-pipeline-performance-optimization.md`, `docs/adr/0007-icbc-llm-provider-via-registry.md`, `docs/adr/0008-icbc-endpoint-openai-streaming.md`, `docs/adr/0009-attribution-driven-reflection-participation.md`
+- 架构决策: `docs/adr/0001-adapter-layer-in-evoagent.md`, `docs/adr/0002-scenario-folder-api-multi-skill.md`, `docs/adr/0003-adapter-sidecar-platform-integration-sse.md`, `docs/adr/0004-evaluator-optimizer-integration.md`, `docs/adr/0005-platform-template-driven-api.md`, `docs/adr/0006-skill-pipeline-performance-optimization.md`, `docs/adr/0007-icbc-llm-provider-via-registry.md`, `docs/adr/0008-icbc-endpoint-openai-streaming.md`, `docs/adr/0009-attribution-driven-reflection-participation.md`, `docs/adr/0010-managed-doc-optimization-integration.md`
 
 ## 关键约束速查
 

@@ -2169,6 +2169,76 @@ async def test_rollout_phase2_uses_batch_evaluate_with_num_parallel() -> None:
 
 
 @pytest.mark.asyncio
+async def test_rollout_records_trace_unavailable_in_detailed_training_batch() -> None:
+    """缺失 trace 不进入 reflect，但必须以稳定 case identity 写入训练 outcome。"""
+    from openjiuwen.agent_evolving.dataset import Case, EvaluatedCase
+
+    from evo_agent.evaluator.batch_result import (
+        EvaluationBatchResult,
+        EvaluationOutcome,
+    )
+
+    optimizer = _build_optimizer_with_phase_cb(lambda _event, _data: None)
+    cases = [
+        Case(case_id="c1", inputs={"query": "missing"}, label={"expected": "x"}),
+        Case(case_id="c2", inputs={"query": "ok"}, label={"expected": "y"}),
+    ]
+
+    def detailed_evaluate(
+        eval_cases: list[Case], predicts: list[dict[str, Any]], **kwargs: Any
+    ) -> EvaluationBatchResult:
+        assert [case.case_id for case in eval_cases] == ["c2"]
+        assert predicts == [{"answer": "mock"}]
+        assert kwargs["enable_attribution"] is True
+        evaluated = EvaluatedCase(case=eval_cases[0], answer=predicts[0], score=0.8)
+        return EvaluationBatchResult(
+            (
+                EvaluationOutcome(
+                    0,
+                    "c2",
+                    eval_cases[0],
+                    eval_cases[0].inputs["trajectory"],
+                    evaluated,
+                    None,
+                ),
+            )
+        )
+
+    optimizer._evaluator = MagicMock()
+    optimizer._evaluator.batch_evaluate_detailed = detailed_evaluate
+    optimizer._evaluator.batch_evaluate = MagicMock(
+        side_effect=AssertionError("legacy evaluator path used")
+    )
+    optimizer._adapter_client = AsyncMock()
+    optimizer._adapter_client.get_traces = AsyncMock(
+        side_effect=[
+            {"messages": []},
+            {"messages": [{"role": "user", "content": "hi"}]},
+        ]
+    )
+    optimizer._agent = AsyncMock()
+    optimizer._agent.invoke = AsyncMock(return_value={"answer": "mock"})
+    optimizer._conversation_id_factory = None
+    optimizer._trace_max_retries = 1
+    optimizer._trace_retry_backoff = 0.0
+    optimizer._rollout_extra_data = {}
+    optimizer._artifact_epoch = 1
+    optimizer._num_parallel = 2
+
+    evaluated, trajectories = await optimizer._rollout(cases)
+
+    assert [item.case.case_id for item in evaluated] == ["c2"]
+    assert [item["case_id"] for item in trajectories] == ["c2"]
+    assert [outcome.case_id for outcome in optimizer._last_training_batch.outcomes] == [
+        "c1",
+        "c2",
+    ]
+    infrastructure_failure = optimizer._last_training_batch.outcomes[0].failure
+    assert infrastructure_failure is not None
+    assert infrastructure_failure.category == "trace_unavailable"
+
+
+@pytest.mark.asyncio
 async def test_attribute_pushes_attribute_event() -> None:
     """_attribute pushes attribute phase event."""
     from openjiuwen.agent_evolving.dataset import Case, EvaluatedCase

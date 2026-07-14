@@ -14,6 +14,18 @@ from evo_agent.types import OptimizeReport, SkillContentSnapshot, SkillScore, Tr
 logger = logging.getLogger(__name__)
 
 
+def _training_eval_files(root: Path) -> list[Path]:
+    """Return only epoch/step training results, excluding validation artifacts."""
+    files = []
+    for path in root.rglob("eval_results.json"):
+        if not path.parent.name.startswith("step_"):
+            continue
+        if not any(parent.name.startswith("epoch_") for parent in path.parents):
+            continue
+        files.append(path)
+    return sorted(files)
+
+
 class ReportFormatter:
     """读取 artifact 目录，生成人类可读的优化报告。
 
@@ -299,7 +311,7 @@ class ReportFormatter:
         if not self._artifact_dir.exists():
             return None
 
-        eval_files: list[Path] = sorted(self._artifact_dir.rglob("eval_results.json"))
+        eval_files = _training_eval_files(self._artifact_dir)
         if not eval_files:
             return None
 
@@ -324,7 +336,7 @@ class ReportFormatter:
         """从第一个 eval_results.json 获取 case 数量。"""
         if not self._artifact_dir.exists():
             return 0
-        eval_files = sorted(self._artifact_dir.rglob("eval_results.json"))
+        eval_files = _training_eval_files(self._artifact_dir)
         if not eval_files:
             return 0
         try:
@@ -338,7 +350,7 @@ class ReportFormatter:
         """扫描所有 eval_results.json，返回最高 avg_score。"""
         if not self._artifact_dir.exists():
             return None
-        eval_files = sorted(self._artifact_dir.rglob("eval_results.json"))
+        eval_files = _training_eval_files(self._artifact_dir)
         if not eval_files:
             return None
         scores: list[float] = []
@@ -364,7 +376,7 @@ class ReportFormatter:
         """
         if not self._artifact_dir.exists():
             return None
-        eval_files = sorted(self._artifact_dir.rglob("eval_results.json"))
+        eval_files = _training_eval_files(self._artifact_dir)
         if not eval_files:
             return None
         best_data: dict[str, Any] | None = None
@@ -513,7 +525,7 @@ class ReportFormatter:
         # 收集所有 eval_results.json（按 epoch/step 排序）
         eval_files: list[Path] = []
         for search_dir in search_dirs:
-            for p in sorted(search_dir.rglob("eval_results.json")):
+            for p in _training_eval_files(search_dir):
                 if p not in eval_files:
                     eval_files.append(p)
 

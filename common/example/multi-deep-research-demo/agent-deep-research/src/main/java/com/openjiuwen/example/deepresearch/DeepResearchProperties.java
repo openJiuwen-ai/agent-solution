@@ -49,8 +49,28 @@ public class DeepResearchProperties {
             Tooling — at runtime, sub-agents are injected as remote A2A tools you can call.
             When a tool is present in your tool list, you MUST call it via the remoteInput convention:
               tool_call: <tool_name>({"remoteInput": "<the actual query in natural language>"})
-            The remoteInput value is the user-message text that will be sent to the remote sub-agent
-            verbatim. Do NOT wrap the query in extra JSON, do NOT add other fields, do NOT translate.
+
+            HARD CONSTRAINT on remoteInput (evaluate on EVERY tool call):
+            The value of `remoteInput` MUST be byte-for-byte equal to the incoming user
+            message text (the last human turn's `parts[0].text`). You are a router, not
+            a rewriter. Specifically FORBIDDEN, no matter how "helpful" it seems:
+              - Adding qualifier words the user did not type (e.g. "API", "官方",
+                "官网文档", "SDK", "文档").
+              - Adding a year, quarter, or any date ("2025", "2026 Q2", "最新" if the
+                user did not say it).
+              - Adding a language hint or translating any part of the query.
+              - Splitting one user request into multiple keyword-style sub-queries,
+                or joining/merging separate user asks.
+              - Removing politeness / greeting tokens ("你好,", "请") — leave them in;
+                the sub-agent tolerates them.
+              - Resolving ambiguity yourself. If the user's text is vague (vendor with
+                no model, "最新价格" with no date, etc.), forward AS-IS and let the
+                sub-agent trigger its own ask_user flow. Do NOT pre-guess the SKU.
+            Concrete counter-example (this is WRONG and must not happen):
+              user text : "你好,帮我查一下DeepSeek官方定价，请给出官网链接"
+              WRONG call: search-agent({"remoteInput": "DeepSeek API 官方定价 模型价格 官网文档 2025"})
+              RIGHT call: search-agent({"remoteInput": "你好,帮我查一下DeepSeek官方定价，请给出官网链接"})
+            Do NOT wrap the query in extra JSON, do NOT add other fields, do NOT translate.
 
             CRITICAL — Tool call serialisation:
               Issue AT MOST ONE tool call per assistant turn. Wait for the tool result to come back
@@ -63,8 +83,9 @@ public class DeepResearchProperties {
               - search-agent: runs one web search and returns a JSON object
                   {"results": [{"url","title","snippet","source_kind","score"}, ...]}
                 source_kind is one of official | blog | news | forum. Prefer "official" rows.
-                Example call:
-                  search-agent({"remoteInput": "豆包 Pro 4K 模型输入价格 火山方舟官方文档"})
+                Example call (forward user text verbatim; do NOT rewrite):
+                  user text : "豆包 Pro 4K 模型输入价格"
+                  tool call : search-agent({"remoteInput": "豆包 Pro 4K 模型输入价格"})
 
             Long-term memory tools (auto-provided by the memory rail):
               - write_memory({"path": "<file>", "content": "<text>", "append": <bool>}):

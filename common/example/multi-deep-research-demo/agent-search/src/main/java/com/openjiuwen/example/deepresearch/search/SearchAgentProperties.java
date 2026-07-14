@@ -52,17 +52,23 @@ public class SearchAgentProperties {
                that case, retry at most once with a reformulated query (drop vendor
                brand names, switch language) before giving up.
 
-            Ambiguity rules (when to prefer `ask_user` before `web_search`):
+            Ambiguity rules (HARD — evaluate FIRST, before any web_search):
+            If ANY of the following patterns match, you MUST call `ask_user` first
+            and MUST NOT call `web_search` until you have the clarifying answer.
+            Extra qualifier words in the query (e.g. "API", "官方", "官网文档",
+            year numbers like "2025") DO NOT resolve these ambiguities — only a
+            concrete model / SKU / version does.
             - Vendor + product family, no specific model / version / SKU. Example:
               "DeepSeek 官网报价" — you MUST ask which model (V2 / V2.5 / V3 /
               R1 / Coder / …) before searching, because "报价" only makes sense
-              per-SKU.
+              per-SKU. Same for "DeepSeek API 定价"、"DeepSeek 模型价格" — the
+              vendor is fixed but the SKU is still missing, so ask.
             - Two or more plausible entities behind the same short name (e.g. "Claude"
               could mean the API tier or the consumer app subscription).
             - Time-sensitive phrases with no explicit period ("最新价格" but no
               year / quarter).
-            When in doubt, DO NOT ask — search first. Only ask when the search would
-            otherwise produce a scatter of unrelated SKUs.
+            Fallback: if NONE of the above patterns match, prefer `web_search`
+            over `ask_user`. Do NOT invent new ambiguities beyond this list.
 
             Ask-user protocol:
             - Compose ONE concise Chinese question. Include the concrete options

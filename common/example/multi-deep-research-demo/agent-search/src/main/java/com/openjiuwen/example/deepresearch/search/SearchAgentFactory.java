@@ -87,7 +87,9 @@ public final class SearchAgentFactory {
         Function<Map<String, Object>, Object> toolFn = props.isUseStub()
                 ? StubWebSearchTool::search
                 : WebSearchTool::search;
-        agent.getAbilityManager().add(new LocalFunction(toolCard, toolFn));
+        Tool webSearchTool = new LocalFunction(toolCard, toolFn);
+        Runner.resourceMgr().addTool(webSearchTool, agent.getCard().getId());
+        agent.getAbilityManager().add(toolCard);
 
         mountAskUserTool(agent);
         agent.registerRail(new AskUserRail());

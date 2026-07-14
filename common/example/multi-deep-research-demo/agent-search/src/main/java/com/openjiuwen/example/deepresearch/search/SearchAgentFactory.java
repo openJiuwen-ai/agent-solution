@@ -103,6 +103,8 @@ public final class SearchAgentFactory {
      * which surfaces at the runtime as {@code __interaction__} / {@code TYPE_INTERRUPT}. When the
      * caller supplies a next-turn text, the rail resumes with that text as the tool result — the
      * tool body itself is never actually executed, so this echo function is only a placeholder.
+     *
+     * @param agent the ReAct agent that the {@code ask_user} tool is bound to
      */
     private static void mountAskUserTool(ReActAgent agent) {
         ToolCard askUserCard = ToolCard.builder()

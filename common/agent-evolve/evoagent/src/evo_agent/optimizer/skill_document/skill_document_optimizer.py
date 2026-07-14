@@ -1479,8 +1479,13 @@ class SkillDocumentOptimizer(BaseOptimizer):  # type: ignore[misc]
 
     def _sync_skill_to_operator(self, skill_content: str) -> None:
         """Make intermediate skill visible to agent before next rollout."""
-        for op in self._operators.values():
+        for op_id, op in self._operators.items():
             op.set_parameter(SKILL_CONTENT_TARGET, skill_content)
+            # spec F6: normalize 可能改写 candidate，reread 回填 cache，
+            # 使 cache/operator/remote 一致；普通 operator 原样存即 no-op。
+            self._current_skill_by_operator[op_id] = cast(
+                str, op.get_state().get("skill_content", "")
+            )
 
     def _read_skills_from_operators(self) -> dict[str, str]:
         """Read skill_content from each bound operator."""
@@ -1495,6 +1500,11 @@ class SkillDocumentOptimizer(BaseOptimizer):  # type: ignore[misc]
         op = self._operators.get(operator_id)
         if op is not None:
             op.set_parameter(SKILL_CONTENT_TARGET, skill_content)
+            # spec F6: normalize 可能改写 candidate，reread 回填 cache，
+            # 使 cache/operator/remote 一致；普通 operator 原样存即 no-op。
+            self._current_skill_by_operator[operator_id] = cast(
+                str, op.get_state().get("skill_content", "")
+            )
 
     def _sync_skills_to_operators(self, skills: dict[str, str]) -> None:
         """Sync all operators' skill content at once."""

@@ -37,6 +37,9 @@ from evo_agent.adapter_client.types import (
 )
 from evo_agent.callbacks.composed_callbacks import ComposedCallbacks
 from evo_agent.errors import ManagedDocApplyError
+from evo_agent.optimizer.skill_document.skill_document_optimizer import (
+    SkillDocumentOptimizer,
+)
 
 _DOC_KIND = "agent_rule"
 
@@ -321,3 +324,71 @@ async def test_protected_edit_commits_same_content_to_cache_operator_and_remote(
 
     # remote 收到的 POST 内容 == committed（cache/operator/remote 一致）
     assert stub.post_calls[-1] == committed
+
+
+# ── 7. spec F6: optimizer cache 经 reread 与 operator/remote 一致 ──
+#
+# 现有 test 6 只直接调 operator.set_parameter，未覆盖 optimizer cache 路径。
+# 这两个测试经 SkillDocumentOptimizer._sync_skill_to_operator_by_id /
+# _sync_skill_to_operator 触发，验证 reread 把 normalized 写回 _current_skill_by_operator。
+
+
+def _make_protected_baseline() -> tuple[str, tuple[ProtectedSection, ...], str]:
+    """baseline + protected marker pair + candidate（candidate 改 protected 区段内容）。"""
+    start, end = "<!-- PROTECT_START -->", "<!-- PROTECT_END -->"
+    baseline = f"# agent rule\n{start}\nMUST KEEP THIS RULE\n{end}\nbody line\n"
+    protected = (ProtectedSection(start, end),)
+    candidate = f"# agent rule\n{start}\nATTEMPTED CHANGE\n{end}\nnew body line\n"
+    return baseline, protected, candidate
+
+
+def test_sync_skill_to_operator_by_id_rereads_normalized_into_cache() -> None:
+    """spec F6：set_parameter 后 optimizer reread committed 状态回填 cache。
+
+    managed-doc 的 ContentPolicy.normalize() 会改写 candidate（protected 区段用 baseline
+    替换）。旧实现 _sync_skill_to_operator_by_id 只 set_parameter(raw) 不 reread，cache 停在
+    raw candidate，与 operator/remote（normalized）不一致 → analyst prompt 读到错误版本。
+    修复后 cache == operator.get_state() == remote POST，三者一致。
+    """
+    baseline, protected, candidate = _make_protected_baseline()
+    stub = StubAdapterClient(baseline_content=baseline)
+    operator = _make_operator(stub, baseline_content=baseline, protected=protected)
+
+    # 绕过重依赖 __init__，手动设两个 cache dict（测单方法 reread 行为）
+    optimizer = SkillDocumentOptimizer.__new__(SkillDocumentOptimizer)
+    optimizer._operators = {"md": operator}
+    optimizer._current_skill_by_operator = {"md": ""}
+
+    optimizer._sync_skill_to_operator_by_id("md", candidate)
+
+    committed = operator.get_state()["skill_content"]
+    # cache 已被 reread 回填为 normalized（非 raw candidate）
+    assert optimizer._current_skill_by_operator["md"] == committed
+    assert "MUST KEEP THIS RULE" in committed
+    assert "ATTEMPTED CHANGE" not in committed
+    # remote POST == committed == cache 三者一致
+    assert stub.post_calls[-1] == committed == optimizer._current_skill_by_operator["md"]
+
+
+def test_sync_skill_to_operator_rereads_normalized_into_cache_batch() -> None:
+    """spec F6 批量路径：_sync_skill_to_operator 遍历 .items() reread 每个 operator。"""
+    baseline, protected, candidate = _make_protected_baseline()
+    stub_a = StubAdapterClient(baseline_content=baseline)
+    stub_b = StubAdapterClient(baseline_content=baseline)
+    op_a = _make_operator(stub_a, baseline_content=baseline, protected=protected)
+    op_b = _make_operator(stub_b, baseline_content=baseline, protected=protected)
+
+    optimizer = SkillDocumentOptimizer.__new__(SkillDocumentOptimizer)
+    optimizer._operators = {"a": op_a, "b": op_b}
+    optimizer._current_skill_by_operator = {"a": "", "b": ""}
+
+    optimizer._sync_skill_to_operator(candidate)
+
+    committed_a = op_a.get_state()["skill_content"]
+    committed_b = op_b.get_state()["skill_content"]
+    assert optimizer._current_skill_by_operator["a"] == committed_a
+    assert optimizer._current_skill_by_operator["b"] == committed_b
+    assert "ATTEMPTED CHANGE" not in committed_a
+    assert "ATTEMPTED CHANGE" not in committed_b
+    assert stub_a.post_calls[-1] == committed_a == optimizer._current_skill_by_operator["a"]
+    assert stub_b.post_calls[-1] == committed_b == optimizer._current_skill_by_operator["b"]

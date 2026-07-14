@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 from pathlib import Path
 
@@ -31,7 +33,20 @@ def test_agent_rule_optimization_changes_live_agent_behavior(tmp_path: Path) -> 
         assert task["down_seen"] is True
         assert snapshot["pending_apply"] is False
         assert snapshot["file_revision"] == snapshot["applied_revision"]
+        assert task["revision"] == snapshot["applied_revision"]
+        assert snapshot["content"] == report.managed_doc_content_after
+        assert (
+            hashlib.sha256(snapshot["content"].encode()).hexdigest() == snapshot["applied_revision"]
+        )
         assert harness.ask("Which rule version is active now?") == "NEW"
+
+        cleaned_traces = harness.get_optimization_traces()
+        cleaned_answers = {trace["messages"][-1]["content"] for trace in cleaned_traces}
+        assert {"OLD", "NEW"} <= cleaned_answers
+        assert all(
+            [message["role"] for message in trace["messages"]] == ["user", "assistant"]
+            for trace in cleaned_traces
+        )
 
         assert report.managed_doc_kind == "agent_rule"
         assert report.epochs_completed == 1
@@ -39,9 +54,20 @@ def test_agent_rule_optimization_changes_live_agent_behavior(tmp_path: Path) -> 
         assert "candidate" in report.gate_results
         assert "ANSWER=OLD" in (report.managed_doc_content_before or "")
         assert "ANSWER=NEW" in (report.managed_doc_content_after or "")
+        assert (report.artifact_dir / "managed_doc_before.md").read_text(
+            encoding="utf-8"
+        ) == report.managed_doc_content_before
         assert (report.artifact_dir / "managed_doc_final.md").read_text(
             encoding="utf-8"
         ) == report.managed_doc_content_after
+        ledger = json.loads(
+            (report.artifact_dir / "managed_doc_tasks.json").read_text(encoding="utf-8")
+        )
+        assert tuple(ledger["task_ids"]) == report.managed_doc_task_ids
+        task_records = [record for record in ledger["doc_kind_records"] if record["task_id"]]
+        assert all(record["status"] == "SUCCEEDED" for record in task_records)
+        assert all(record["total_time"] >= record["post_time"] >= 0 for record in task_records)
+        assert all(record["total_time"] >= record["poll_time"] >= 0 for record in task_records)
         diff = (report.artifact_dir / "managed_doc_diff.patch").read_text(encoding="utf-8")
         assert "-ANSWER=OLD" in diff
         assert "+ANSWER=NEW" in diff

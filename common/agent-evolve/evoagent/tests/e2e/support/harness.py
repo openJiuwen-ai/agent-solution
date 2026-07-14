@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shlex
 import shutil
 import socket
 import subprocess
@@ -50,6 +51,8 @@ class ManagedDocE2EHarness:
         )
         self._agent_port = _free_port()
         self._adapter_port = _free_port()
+        while self._adapter_port == self._agent_port:
+            self._adapter_port = _free_port()
         self._agent_url = f"http://127.0.0.1:{self._agent_port}"
         self._adapter_url = f"http://127.0.0.1:{self._adapter_port}"
         self._rule_path = root / "agent" / "AgentRule.md"
@@ -58,6 +61,7 @@ class ManagedDocE2EHarness:
         self._adapter_config = root / "adapter.yaml"
         self._dataset_manifest = root / "dataset.yaml"
         self._processes: list[tuple[str, subprocess.Popen[str], TextIO]] = []
+        self._http = httpx.Client(trust_env=False)
 
     def __enter__(self) -> Self:
         try:
@@ -93,10 +97,11 @@ class ManagedDocE2EHarness:
                 process.kill()
                 process.wait(timeout=5)
             stream.close()
+        self._http.close()
 
     def ask(self, query: str) -> str:
         conversation_id = f"manual-{uuid.uuid4().hex}"
-        response = httpx.post(
+        response = self._http.post(
             f"{self._adapter_url}/api/v1/agents/{_AGENT_NAME}/conversations/{conversation_id}",
             json={"query": query},
             timeout=10,
@@ -137,7 +142,7 @@ class ManagedDocE2EHarness:
             return asyncio.run(run_optimization(request, config))
 
     def get_managed_doc(self) -> dict[str, Any]:
-        response = httpx.post(
+        response = self._http.post(
             f"{self._adapter_url}/api/v1/managed-docs",
             json={
                 "agent_name": _AGENT_NAME,
@@ -150,9 +155,35 @@ class ManagedDocE2EHarness:
         return response.json()
 
     def get_task(self, task_id: str) -> dict[str, Any]:
-        response = httpx.get(f"{self._adapter_url}/api/v1/managed-docs/tasks/{task_id}", timeout=5)
+        response = self._http.get(
+            f"{self._adapter_url}/api/v1/managed-docs/tasks/{task_id}", timeout=5
+        )
         response.raise_for_status()
         return response.json()
+
+    def get_optimization_traces(self) -> list[dict[str, Any]]:
+        response = self._http.get(
+            f"{self._adapter_url}/api/v1/agents/{_AGENT_NAME}/traces", timeout=5
+        )
+        response.raise_for_status()
+        conversation_ids = [
+            conversation_id
+            for conversation_id in response.json()["conversation_ids"]
+            if not conversation_id.startswith("manual-")
+        ]
+        traces: list[dict[str, Any]] = []
+        for conversation_id in conversation_ids:
+            cleaned = self._http.get(
+                f"{self._adapter_url}/api/v1/agents/{_AGENT_NAME}/cleaned-traces/{conversation_id}",
+                timeout=5,
+            )
+            cleaned.raise_for_status()
+            body = cleaned.json()
+            if body.get("messages"):
+                traces.append(body)
+        if not traces:
+            raise RuntimeError("Adapter produced no cleaned optimization traces")
+        return traces
 
     def _validate_adapter_repo(self) -> None:
         if not (self._adapter_repo / "pyproject.toml").is_file():
@@ -169,7 +200,9 @@ class ManagedDocE2EHarness:
         self._rule_path.write_text(_RULE, encoding="utf-8")
         self._log_path.touch()
         helper = Path(__file__).with_name("restart_mock_agent.py")
-        restart_cmd = f"{sys.executable} {helper} {self._agent_url}/__test__/restart"
+        restart_cmd = shlex.join(
+            [sys.executable, str(helper), f"{self._agent_url}/__test__/restart"]
+        )
         config = {
             "host": "127.0.0.1",
             "port": self._adapter_port,
@@ -260,6 +293,10 @@ class ManagedDocE2EHarness:
             for key, value in os.environ.items()
             if not key.startswith("ADAPTER_") and key != "VIRTUAL_ENV"
         }
+        loopback_hosts = "127.0.0.1,localhost"
+        for key in ("NO_PROXY", "no_proxy"):
+            current = env.get(key, "").strip(",")
+            env[key] = f"{current},{loopback_hosts}" if current else loopback_hosts
         env.update({"PYTHONUNBUFFERED": "1", "ADAPTER_LOG_LEVEL": "WARNING"})
         self._spawn(
             "Adapter",
@@ -296,7 +333,7 @@ class ManagedDocE2EHarness:
             if process.poll() is not None:
                 raise RuntimeError(self._process_failure(process_name, process.returncode))
             try:
-                response = httpx.get(url, timeout=0.5)
+                response = self._http.get(url, timeout=0.5)
                 if response.status_code == 200:
                     return
             except httpx.HTTPError:
@@ -306,7 +343,7 @@ class ManagedDocE2EHarness:
 
     def _bootstrap_applied_revision(self) -> None:
         snapshot = self.get_managed_doc()
-        response = httpx.post(
+        response = self._http.post(
             f"{self._adapter_url}/api/v1/managed-docs",
             json={
                 "agent_name": _AGENT_NAME,

@@ -334,6 +334,37 @@ def test_applier_poll_interval_2s_between_gets() -> None:
     assert sleeps == [2.0]
 
 
+def test_applier_poll_time_includes_sleep_durations() -> None:
+    """P2#7：poll_time 含 sleep 耗时，不再只计网络段（低估墙钟）。"""
+    content = "# rule"
+    h = _hash(content)
+    ticks = [0.0]
+    sleeps: list[float] = []
+
+    def fake_clock() -> float:
+        return ticks[0]
+
+    def fake_sleeper(d: float) -> None:
+        sleeps.append(d)
+        ticks[0] += d  # sleep 推进时钟，网络段不推进
+
+    client = FakeAdapterClient(
+        post_responses=[UpdateStarted(task_id="task-1")],
+        task_responses=[_task("RUNNING"), _task("SUCCEEDED", revision=h)],
+    )
+    applier = ManagedDocApplier(
+        adapter_client=client,
+        doc_kind="agent_rule",
+        poll_interval=2.0,
+        clock=fake_clock,
+        sleeper=fake_sleeper,
+    )
+    applier.apply_and_wait(content)
+    assert sleeps == [2.0]
+    # fake clock 仅被 sleep 推进 → poll_time 全部来自 sleep（2.0），网络段为 0
+    assert applier.records[-1].poll_time == 2.0
+
+
 # ── 13. records success/failure/noop ──
 
 

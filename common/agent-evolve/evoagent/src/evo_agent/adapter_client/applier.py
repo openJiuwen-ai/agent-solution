@@ -345,9 +345,12 @@ class ManagedDocApplier:
             try:
                 task = self._client.get_managed_doc_task_sync(task_id, request_timeout=remaining)
             except httpx.TransportError:
-                # 临时网络错误 → 继续轮询
+                # 临时网络错误 → 继续轮询（sleep 耗时纳入 poll_time）
                 poll_time += self._clock() - poll_start
-                if not self._sleep_within_budget(start):
+                sleep_start = self._clock()
+                slept = self._sleep_within_budget(start)
+                poll_time += self._clock() - sleep_start
+                if not slept:
                     total = self._clock() - start
                     raise self._fail(
                         phase="deadline",
@@ -373,8 +376,11 @@ class ManagedDocApplier:
                         poll_time=poll_time,
                     )
                 if e.status_code in (502, 503, 504):
-                    # 临时 → 继续轮询
-                    if not self._sleep_within_budget(start):
+                    # 临时 → 继续轮询（sleep 耗时纳入 poll_time）
+                    sleep_start = self._clock()
+                    slept = self._sleep_within_budget(start)
+                    poll_time += self._clock() - sleep_start
+                    if not slept:
                         total = self._clock() - start
                         raise self._fail(
                             phase="deadline",
@@ -440,8 +446,11 @@ class ManagedDocApplier:
                     poll_time=poll_time,
                     total_time=total,
                 )
-            # PENDING / RUNNING → sleep poll_interval 后继续
-            if not self._sleep_within_budget(start):
+            # PENDING / RUNNING → sleep poll_interval 后继续（sleep 耗时纳入 poll_time）
+            sleep_start = self._clock()
+            slept = self._sleep_within_budget(start)
+            poll_time += self._clock() - sleep_start
+            if not slept:
                 total = self._clock() - start
                 raise self._fail(
                     phase="deadline",

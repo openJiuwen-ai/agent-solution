@@ -10,6 +10,7 @@ import asyncio
 import dataclasses
 import hashlib
 import json
+import math
 import os
 import uuid
 from collections.abc import Awaitable, Callable
@@ -134,14 +135,16 @@ def _validate_managed_doc_baseline(
             f"revision); pending_apply={snapshot.pending_apply}",
         )
     margin = 10.0
-    if deadline < snapshot.max_task_seconds + margin:
+    mts = snapshot.max_task_seconds
+    # NaN max_task_seconds/deadline 使 `<` 恒 False 绕过门（IEEE 754），需显式守卫。
+    if math.isnan(mts) or math.isnan(deadline) or deadline < mts + margin:
         raise ManagedDocBaselineError(
             agent_name=agent_name,
             doc_kind=doc_kind,
             reason="deadline",
             diagnostics=f"deadline={deadline}s < max_task_seconds+{margin}s="
-            f"{snapshot.max_task_seconds + margin}s (deploy deadline must exceed "
-            f"adapter worst-case task duration); max_task_seconds={snapshot.max_task_seconds}",
+            f"{mts + margin}s (deploy deadline must exceed adapter worst-case task "
+            f"duration); max_task_seconds={mts} (NaN gate guard)",
         )
     # diagnostics 仅在失败路径使用，成功路径静默；保留 diag 计算避免 unused。
     _ = diag

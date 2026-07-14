@@ -1405,6 +1405,20 @@ async def test_runner_job_start_rejects_file_only_apply_mode(
     assert exc_info.value.reason == "apply_mode"
 
 
+async def test_runner_job_start_rejects_nan_max_task_seconds(
+    tmp_path: Path,
+    make_harness: Callable[[], SimpleNamespace],
+) -> None:
+    """P2#9：max_task_seconds=NaN 使 `<` 恒 False 绕过门（IEEE 754），math.isnan 守卫拒绝。"""
+    from evo_agent.errors import ManagedDocBaselineError
+
+    snap = _make_valid_snapshot(max_task_seconds=float("nan"))
+    h = _md_harness_with_snapshot(make_harness, snap)
+    with pytest.raises(ManagedDocBaselineError) as exc_info:
+        await h.run(_make_request(managed_doc_kind="agent_rule"), _make_config(tmp_path))
+    assert exc_info.value.reason == "deadline"
+
+
 async def test_runner_job_start_rejects_deadline_below_max_task_seconds_plus_margin(
     tmp_path: Path,
     make_harness: Callable[[], SimpleNamespace],

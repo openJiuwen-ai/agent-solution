@@ -259,14 +259,20 @@ class AdapterClient:
             "/api/v1/managed-docs", json=body, timeout=self._sync_timeout(request_timeout)
         )
         data = self._handle_response(response)
-        return ManagedDocSnapshot(
-            content=data["content"],
-            file_revision=data["file_revision"],
-            applied_revision=data.get("applied_revision"),
-            pending_apply=data["pending_apply"],
-            apply_mode=data["apply_mode"],
-            max_task_seconds=data["max_task_seconds"],
-        )
+        try:
+            return ManagedDocSnapshot(
+                content=data["content"],
+                file_revision=data["file_revision"],
+                applied_revision=data.get("applied_revision"),
+                pending_apply=data["pending_apply"],
+                apply_mode=data["apply_mode"],
+                max_task_seconds=data["max_task_seconds"],
+            )
+        except (ValueError, KeyError, TypeError) as e:
+            raise AdapterError(
+                f"missing field in managed-doc snapshot: {e}",
+                status_code=response.status_code,
+            ) from e
 
     def start_managed_doc_update_sync(
         self,
@@ -291,10 +297,16 @@ class AdapterClient:
             "/api/v1/managed-docs", json=body, timeout=self._sync_timeout(request_timeout)
         )
         data = self._handle_response(response)
-        # Adapter: 202 if "task_id" in result else 200（routes.py 状态码分支）
-        if response.status_code == 202 or "task_id" in data:
-            return UpdateStarted(task_id=data["task_id"])
-        return AlreadyApplied(revision=data["revision"])
+        try:
+            # Adapter: 202 if "task_id" in result else 200（routes.py 状态码分支）
+            if response.status_code == 202 or "task_id" in data:
+                return UpdateStarted(task_id=data["task_id"])
+            return AlreadyApplied(revision=data["revision"])
+        except (ValueError, KeyError, TypeError) as e:
+            raise AdapterError(
+                f"missing field in managed-doc update result: {e}",
+                status_code=response.status_code,
+            ) from e
 
     def get_managed_doc_task_sync(
         self,
@@ -312,17 +324,23 @@ class AdapterClient:
             timeout=self._sync_timeout(request_timeout),
         )
         data = self._handle_response(response)
-        return TaskState(
-            status=data["status"],
-            task_id=data["task_id"],
-            revision=data.get("revision"),
-            pending_apply=data["pending_apply"],
-            last_error=data.get("last_error"),
-            attempts=data["attempts"],
-            down_seen=data.get("down_seen"),
-            created_at=data.get("created_at"),
-            updated_at=data.get("updated_at"),
-        )
+        try:
+            return TaskState(
+                status=data["status"],
+                task_id=data["task_id"],
+                revision=data.get("revision"),
+                pending_apply=data["pending_apply"],
+                last_error=data.get("last_error"),
+                attempts=data["attempts"],
+                down_seen=data.get("down_seen"),
+                created_at=data.get("created_at"),
+                updated_at=data.get("updated_at"),
+            )
+        except (ValueError, KeyError, TypeError) as e:
+            raise AdapterError(
+                f"missing field in managed-doc task state: {e}",
+                status_code=response.status_code,
+            ) from e
 
     async def skill_list(self) -> list[dict[str, Any]]:
         """POST /api/v1/skills  action=skill_list
@@ -398,7 +416,16 @@ class AdapterClient:
                 message = response.text
             raise AdapterError(message, status_code=response.status_code)
 
-        return response.json()  # type: ignore[no-any-return]
+        try:
+            data = response.json()
+        except (ValueError, KeyError, TypeError) as e:
+            # 成功路径(2xx) 也可能 malformed JSON；schema 失败必须转 fatal，
+            # 否则 Applier 的 except AdapterError 漏接 → 静默故障（训练继续但 remote 未确认）。
+            raise AdapterError(
+                f"malformed success response (status={response.status_code}): {e}",
+                status_code=response.status_code,
+            ) from e
+        return data  # type: ignore[no-any-return]
 
     async def _request_with_retry(
         self,

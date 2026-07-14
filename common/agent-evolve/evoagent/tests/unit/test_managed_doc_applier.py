@@ -401,3 +401,25 @@ def test_applier_no_asyncio_run_in_source() -> None:
             if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
                 if func.value.id == "asyncio" and func.attr in {"run", "to_thread"}:
                     pytest.fail(f"applier 禁止 asyncio.{func.attr} 调用")
+
+
+# ── 14. schema 失败(status=200) 经 applier 转 fatal（不静默 retry）──
+
+
+def test_applier_poll_schema_failure_200_is_fatal_not_silent() -> None:
+    """client 层把 schema 失败(malformed/缺字段 2xx)包成 AdapterError(status_code=200)；
+
+    applier poll 分支走「其他 4xx/schema → _fail」转 ManagedDocApplyError(fatal)，
+    不静默 retry，records 留 failed_poll 条目（不静默吞 → 训练继续但 remote 未确认）。
+    """
+    content = "# rule v2"
+    client = FakeAdapterClient(
+        post_responses=[UpdateStarted(task_id="task-1")],
+        # poll 首个响应 = client 层转出的 schema 失败 AdapterError(200)
+        task_responses=[AdapterError("missing field in task state", status_code=200)],
+    )
+    applier = ManagedDocApplier(adapter_client=client, doc_kind="agent_rule", deadline=60.0)
+    with pytest.raises(ManagedDocApplyError) as exc:
+        applier.apply_and_wait(content)
+    assert exc.value.phase == "failed_poll"
+    assert any(r.phase == "failed_poll" for r in applier.records)

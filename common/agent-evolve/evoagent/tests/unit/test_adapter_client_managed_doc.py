@@ -113,8 +113,12 @@ class TestGetManagedDocSync:
             client.get_managed_doc_sync("agent_rule")
         assert exc.value.status_code == 500
 
-    def test_schema_error_missing_field(self) -> None:
-        """响应缺 content 字段 → schema 解析失败（不伪造数据）。"""
+    def test_schema_error_missing_field_raises_adapter_error(self) -> None:
+        """响应缺 content 字段 → schema 失败转 AdapterError(status_code=200)。
+
+        使 Applier 的 except AdapterError 接住转 ManagedDocApplyError(fatal)，
+        而非抛原生 KeyError/ValueError 被 applier 漏接 → 静默故障（训练继续但 remote 未确认）。
+        """
 
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(
@@ -126,8 +130,22 @@ class TestGetManagedDocSync:
             )
 
         client = _make_mock_client(httpx.MockTransport(handler))
-        with pytest.raises((KeyError, ValueError)):
+        with pytest.raises(AdapterError) as exc:
             client.get_managed_doc_sync("agent_rule")
+        assert exc.value.status_code == 200
+
+    def test_malformed_json_200_raises_adapter_error(self) -> None:
+        """200 响应体非法 JSON → _handle_response 成功路径转 AdapterError(fatal)。"""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200, content=b"not-json{", headers={"content-type": "application/json"}
+            )
+
+        client = _make_mock_client(httpx.MockTransport(handler))
+        with pytest.raises(AdapterError) as exc:
+            client.get_managed_doc_sync("agent_rule")
+        assert exc.value.status_code == 200
 
     def test_request_timeout_passthrough(self) -> None:
         """request_timeout 透传到 httpx 单次请求（限制 remaining deadline）。"""
@@ -249,6 +267,17 @@ class TestStartManagedDocUpdateSync:
             client.start_managed_doc_update_sync("agent_rule", "# x")
         assert exc.value.status_code == 400
 
+    def test_missing_field_200_raises_adapter_error(self) -> None:
+        """202 响应缺 task_id → schema 失败转 AdapterError(status_code=202) fatal。"""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(202, json={"revision": "sha-x"})  # 缺 task_id
+
+        client = _make_mock_client(httpx.MockTransport(handler))
+        with pytest.raises(AdapterError) as exc:
+            client.start_managed_doc_update_sync("agent_rule", "# x")
+        assert exc.value.status_code == 202
+
 
 # ── get_managed_doc_task_sync ──
 
@@ -324,3 +353,16 @@ class TestGetManagedDocTaskSync:
         assert ts.status == "FAILED"
         assert ts.last_error == "restart timeout"
         assert ts.down_seen is True
+
+    def test_missing_field_200_raises_adapter_error(self) -> None:
+        """200 响应缺 status → schema 失败转 AdapterError(status_code=200) fatal。"""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(  # 缺 status
+                200, json={"task_id": "task-1", "attempts": 1, "pending_apply": False}
+            )
+
+        client = _make_mock_client(httpx.MockTransport(handler))
+        with pytest.raises(AdapterError) as exc:
+            client.get_managed_doc_task_sync("task-1")
+        assert exc.value.status_code == 200

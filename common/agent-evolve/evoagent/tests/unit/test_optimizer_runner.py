@@ -80,6 +80,14 @@ def _make_config(tmp_path: Path) -> EvolveConfig:
     )
 
 
+def _managed_doc_run_dir(tmp_path: Path, kind: str = "agent_rule") -> Path:
+    """managed-doc run artifact 目录（canonical_id / run_id 嵌套隔离，单测仅一 run）。"""
+    canonical = _make_config(tmp_path).artifact_dir / f"managed_doc:{kind}"
+    run_dirs = [p for p in canonical.iterdir() if p.is_dir()]
+    assert len(run_dirs) == 1, f"expected one run dir under {canonical}, got {run_dirs}"
+    return run_dirs[0]
+
+
 def _make_mock_dataset() -> SimpleNamespace:
     return SimpleNamespace(
         evaluator=MagicMock(),
@@ -1276,11 +1284,36 @@ async def test_runner_managed_doc_canonical_id_used_as_operators_key_and_artifac
     # 4) operators dict key == canonical id
     operators = h.ra_cls.call_args.kwargs["operators"]
     assert set(operators.keys()) == {"managed_doc:agent_rule"}
-    # 5) artifact 目录名 == canonical id
+    # 5) artifact 目录：canonical id 在父层、run_id 在叶层（嵌套隔离）
     run_artifact_dir = h.rf_cls.call_args.args[0]
-    assert run_artifact_dir.name == "managed_doc:agent_rule"
+    assert run_artifact_dir.parent.name == "managed_doc:agent_rule"
+    assert run_artifact_dir.parent.parent == _make_config(tmp_path).artifact_dir
     # 6) trainer skill_names == [canonical id]（评估器经此归因）
     assert h.trainer_cls.call_args.kwargs["skill_names"] == ["managed_doc:agent_rule"]
+
+
+async def test_runner_managed_doc_same_kind_two_runs_isolate_artifact_dirs(
+    tmp_path: Path,
+    make_harness: Callable[[], SimpleNamespace],
+) -> None:
+    """同 kind 二次优化隔离：canonical_id 父层下两个不同 run_id 子目录，互不残留。
+
+    P1#3：避免旧 run 的 epoch_N/eval_results.json 残留污染新报告、
+    以及二次 baseline 失败时旧 managed_doc_before.md 残留误导（违反 F8 AC）。
+    """
+    snap = _make_valid_snapshot(content="# agent rule baseline")
+    request = _make_request(managed_doc_kind="agent_rule")
+    config = _make_config(tmp_path)
+
+    h1 = _md_harness_with_snapshot(make_harness, snap)
+    await h1.run(request, config)
+    h2 = _md_harness_with_snapshot(make_harness, snap)
+    await h2.run(request, config)
+
+    canonical = config.artifact_dir / "managed_doc:agent_rule"
+    run_dirs = sorted(p.name for p in canonical.iterdir() if p.is_dir())
+    assert len(run_dirs) == 2
+    assert run_dirs[0] != run_dirs[1]
 
 
 async def test_runner_job_start_accepts_only_fully_applied_snapshot_no_global_restore(
@@ -1295,9 +1328,7 @@ async def test_runner_job_start_accepts_only_fully_applied_snapshot_no_global_re
     h.adapter.restore_skill.assert_not_called()
     h.adapter.get_managed_doc_sync.assert_called_with("agent_rule")
     # baseline 内容固化为 managed_doc_before.md
-    before = (
-        _make_config(tmp_path).artifact_dir / "managed_doc:agent_rule" / "managed_doc_before.md"
-    )
+    before = _managed_doc_run_dir(tmp_path) / "managed_doc_before.md"
     assert before.read_text(encoding="utf-8") == snap.content
 
 
@@ -1314,7 +1345,7 @@ async def test_runner_job_start_rejects_pending_apply_before_rollout(
         await h.run(_make_request(managed_doc_kind="agent_rule"), _make_config(tmp_path))
     assert exc_info.value.reason == "pending_apply"
     # 校验失败 → 不生成 before.md，但 observed.md + diagnostics 已落盘
-    art_dir = _make_config(tmp_path).artifact_dir / "managed_doc:agent_rule"
+    art_dir = _managed_doc_run_dir(tmp_path)
     assert not (art_dir / "managed_doc_before.md").exists()
     assert (art_dir / "managed_doc_observed.md").exists()
     assert (art_dir / "managed_doc_diagnostics.json").exists()
@@ -1431,7 +1462,7 @@ async def test_runner_failure_after_valid_baseline_writes_before_and_task_ledger
     )
     with pytest.raises(ManagedDocApplyError):
         await h.run(_make_request(managed_doc_kind="agent_rule"), _make_config(tmp_path))
-    art_dir = _make_config(tmp_path).artifact_dir / "managed_doc:agent_rule"
+    art_dir = _managed_doc_run_dir(tmp_path)
     # 有效 baseline 已固化为 before.md
     assert (art_dir / "managed_doc_before.md").read_text(encoding="utf-8") == snap.content
     # finally 刷新 tasks.json，含失败 task_id
@@ -1453,7 +1484,7 @@ async def test_runner_pending_baseline_writes_observed_diagnostics_not_before(
     h = _md_harness_with_snapshot(make_harness, snap)
     with pytest.raises(ManagedDocBaselineError):
         await h.run(_make_request(managed_doc_kind="agent_rule"), _make_config(tmp_path))
-    art_dir = _make_config(tmp_path).artifact_dir / "managed_doc:agent_rule"
+    art_dir = _managed_doc_run_dir(tmp_path)
     assert (art_dir / "managed_doc_observed.md").exists()
     diag_path = art_dir / "managed_doc_diagnostics.json"
     assert diag_path.exists()

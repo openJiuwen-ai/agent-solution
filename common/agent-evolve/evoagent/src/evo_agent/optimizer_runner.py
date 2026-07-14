@@ -345,12 +345,11 @@ async def run_optimization(
     # 0.1 构建 ConversationIdFactory
     conversation_id_factory = ConversationIdFactory(run_id=run_id)
 
-    # artifact 目录：managed-doc 模式用 canonical id 作目录名（spec F7 三处一致
-    # 之一），Skill 模式沿用 run_id（每次运行唯一）。managed-doc 受控窗口下
-    # 同一 kind 一两次优化，目录按 kind 覆盖可接受（第二次以当前已发布内容为
-    # baseline，不回滚上次版本——不变量 4）。
+    # artifact 目录：managed-doc 模式按 canonical id 分组、run_id 隔离每次 run。
+    # 同 kind 二次优化若复用同一目录，旧 epoch_N/eval_results.json 残留污染新报告，
+    # 且 baseline 失败时旧 managed_doc_before.md 残留误导（违反 F8 AC）；嵌套 run_id 隔离。
     if is_managed_doc and canonical_id is not None:
-        run_artifact_dir = config.artifact_dir / canonical_id
+        run_artifact_dir = config.artifact_dir / canonical_id / run_id
     else:
         run_artifact_dir = config.artifact_dir / run_id
 

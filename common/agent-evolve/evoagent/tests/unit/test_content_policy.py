@@ -106,6 +106,17 @@ class TestPreservingContentPolicy:
         normalized = policy.normalize(_CANDIDATE_FRONTMATTER_CHANGED)
         assert "free text edited" in normalized
 
+    def test_candidate_duplicate_start_marker_raises(self) -> None:
+        """candidate 含重复 start_marker → fail-fast（P2#10，与 baseline 侧对称）。"""
+        policy = PreservingContentPolicy(_BASELINE, (self._section(),))
+        section = self._section()
+        candidate = (
+            f"{section.start_marker}body1{section.end_marker}"
+            f"{section.start_marker}body2{section.end_marker}"
+        )
+        with pytest.raises(ContentPolicyError, match="duplicate start_marker in candidate"):
+            policy.normalize(candidate)
+
     def test_no_sections_preserves_frontmatter_only(self) -> None:
         """默认空 marker 列表：仅保留 frontmatter，body 原样透传。"""
         policy = PreservingContentPolicy(_BASELINE, ())

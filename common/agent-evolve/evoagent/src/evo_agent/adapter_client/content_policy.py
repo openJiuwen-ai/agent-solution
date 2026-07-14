@@ -146,9 +146,17 @@ class PreservingContentPolicy(ContentPolicy):
             start_idx = result.find(section.start_marker)
             if start_idx == -1:
                 raise ContentPolicyError(f"candidate lost start_marker: {section.start_marker!r}")
+            if result.count(section.start_marker) > 1:
+                raise ContentPolicyError(
+                    f"duplicate start_marker in candidate: {section.start_marker!r}"
+                )
             end_idx = result.find(section.end_marker, start_idx)
             if end_idx == -1:
                 raise ContentPolicyError(f"candidate lost end_marker: {section.end_marker!r}")
+            if result.count(section.end_marker) > 1:
+                raise ContentPolicyError(
+                    f"duplicate end_marker in candidate: {section.end_marker!r}"
+                )
             span_end = end_idx + len(section.end_marker)
             result = result[:start_idx] + section.text + result[span_end:]
         return result

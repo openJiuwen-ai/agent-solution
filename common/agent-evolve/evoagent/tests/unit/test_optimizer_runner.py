@@ -1316,6 +1316,43 @@ async def test_runner_managed_doc_same_kind_two_runs_isolate_artifact_dirs(
     assert run_dirs[0] != run_dirs[1]
 
 
+async def test_runner_finally_refreshes_diagnostics_after_apply(
+    tmp_path: Path,
+    make_harness: Callable[[], SimpleNamespace],
+) -> None:
+    """P2#8：finally 刷新 managed_doc_diagnostics.json 反映 apply 后状态（≠ job-start）。"""
+    snap_start = _make_valid_snapshot(content="# rule v1", file_revision="rev-1")
+    snap_after = _make_valid_snapshot(
+        content="# rule v1", file_revision="rev-2", applied_revision="rev-2"
+    )
+    h = _md_harness_with_snapshot(make_harness, snap_start)
+    h.adapter.get_managed_doc_sync = MagicMock(side_effect=[snap_start, snap_after])
+    await h.run(_make_request(managed_doc_kind="agent_rule"), _make_config(tmp_path))
+
+    art_dir = _managed_doc_run_dir(tmp_path)
+    diag = json.loads((art_dir / "managed_doc_diagnostics.json").read_text(encoding="utf-8"))
+    assert diag["file_revision"] == "rev-2"  # apply 后状态，非 job-start rev-1
+    assert h.adapter.get_managed_doc_sync.call_count == 2  # job-start baseline + finally refresh
+
+
+async def test_runner_finally_refresh_failure_keeps_job_start_diag(
+    tmp_path: Path,
+    make_harness: Callable[[], SimpleNamespace],
+) -> None:
+    """P2#8：finally 刷新失败时保留 job-start diag，不掩盖主流程结果。"""
+    snap_start = _make_valid_snapshot(content="# rule v1", file_revision="rev-1")
+    h = _md_harness_with_snapshot(make_harness, snap_start)
+    h.adapter.get_managed_doc_sync = MagicMock(
+        side_effect=[snap_start, RuntimeError("refresh boom")]
+    )
+    # 容错吞 refresh 异常，主流程不抛
+    await h.run(_make_request(managed_doc_kind="agent_rule"), _make_config(tmp_path))
+
+    art_dir = _managed_doc_run_dir(tmp_path)
+    diag = json.loads((art_dir / "managed_doc_diagnostics.json").read_text(encoding="utf-8"))
+    assert diag["file_revision"] == "rev-1"  # job-start 值保留，未被失败刷新清空
+
+
 async def test_runner_job_start_accepts_only_fully_applied_snapshot_no_global_restore(
     tmp_path: Path,
     make_harness: Callable[[], SimpleNamespace],

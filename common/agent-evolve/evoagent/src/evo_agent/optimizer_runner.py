@@ -563,8 +563,29 @@ async def run_optimization(
                 num_iterations=resolved.num_epochs,
             )
         finally:
-            if is_managed_doc and managed_operator is not None:
+            if managed_doc_kind is not None and managed_operator is not None:
                 _write_managed_doc_tasks_json(run_artifact_dir, managed_operator.applier.records)
+                # 刷新 diagnostics 反映 apply 后状态（file_revision/applied_revision）；
+                # 失败容错：不掩盖原始 fatal 异常、不覆盖 job-start 有效 diag（spec F8）。
+                try:
+                    snap = await asyncio.to_thread(
+                        adapter_client.get_managed_doc_sync, managed_doc_kind
+                    )
+                    diag = _managed_doc_revision_diagnostics(
+                        snap,
+                        doc_kind=managed_doc_kind,
+                        deadline=config.managed_doc_apply_deadline,
+                        agent_name=resolved.agent_name,
+                    )
+                    _write_atomic_text(
+                        run_artifact_dir / "managed_doc_diagnostics.json",
+                        json.dumps(diag, ensure_ascii=False, indent=2),
+                    )
+                except Exception:  # noqa: BLE001 - 容错刷新，不得掩盖主异常
+                    structlog.get_logger().warning(
+                        "managed-doc diagnostics refresh failed; keeping job-start snapshot",
+                        exc_info=True,
+                    )
 
         # 9.5 回填 gate_result.json 中缺失的 base/candidate 分数
         _rewrite_gate_results(run_artifact_dir, trainer.gate_epoch_scores)

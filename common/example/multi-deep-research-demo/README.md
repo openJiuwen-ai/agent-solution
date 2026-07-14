@@ -117,7 +117,7 @@ multi-deep-research-demo/
 | URL 可达性验证 | Harness tool | `UrlVerifyRail` → Python urllib，在沙箱执行 | LLM 调 `verify_urls` |
 | 长期记忆读写 | MemoryRail tools | core-java 提供 `write_memory` / `read_memory` / `memory_search` / `memory_get` / `edit_memory` | LLM 显式调用或 rail 自动写 |
 | **确定性落盘** | Rail 生命周期钩子 | `AutoPersistMemoryRail.afterInvoke` | 每次 `result_type=="answer"` 自动写 `memory/answer-*.md` + `reports/answer-*.md` |
-| 多轮上下文 | Checkpointer | in-memory（默认）或 Redis（`application-redis-checkpointer.yml`） | 同 `conversationId` 请求走同一状态 |
+| 多轮上下文 | Checkpointer | in-memory（默认）或 Redis（`application-redis-checkpointer.yml`，支持 standalone / cluster） | 同 `conversationId` 请求走同一状态 |
 | 中文字体 | 沙箱代码内置 | `SandboxRail` Python 头部 | Noto Sans CJK SC → Microsoft YaHei → DejaVu Sans 降级 |
 
 `search-agent` 支持 `stub` profile 用本地 fixture 演示，无需 Tavily key；prod profile 需要 `TAVILY_API_KEY`。
@@ -234,6 +234,13 @@ grep -E "Started DeepResearchRuntimeApplication|Discovered remote agent" deep-re
 
 启用 Redis checkpointer：
 
+Runtime 侧的 Redis 中间件（`agent-runtime-java` 提供的 `RuntimeRedisClient` SPI）同时支持 **Redis 单节点（standalone）** 和 **Redis Cluster** 两种部署形态，通过 `REDIS_TYPE` 环境变量切换；两种形态共享同一份 yml/env 骨架，只在 endpoint 描述上有差异：
+
+- **standalone**：`REDIS_TYPE=standalone` + `REDIS_HOST` + `REDIS_PORT`（+ 可选 `REDIS_DB` / `REDIS_PASSWORD`）
+- **cluster**：`REDIS_TYPE=cluster` + `REDIS_NODES=host1:port1,host2:port2,...`（`database` 字段在集群下会被自动忽略并打出 `databaseIgnored=` 警告）
+
+两个 runtime 都激活 `redis-checkpointer` profile 即可共享同一 Redis 后端；库层代码只通过 SPI 访问 Redis，切换 standalone/cluster 不涉及任何 solution 侧代码改动。
+
 ```bash
 # 两个 runtime 共享同一个 Redis 实例；env 一次设置，进程分别激活 profile
 export REDIS_TYPE=${REDIS_TYPE:-standalone}       # standalone | cluster（cluster 需再配 REDIS_NODES）
@@ -250,6 +257,24 @@ java -jar agent-search-runtime-*.jar \
 java -jar agent-deep-research-runtime-0.1.0-SNAPSHOT.jar \
   --spring.profiles.active=redis-checkpointer
 ```
+
+Redis Cluster 部署时把 `REDIS_TYPE` 切成 `cluster`，并用 Spring Boot 的 indexed 语法追加 `nodes[N]` 参数（每个节点一条 `host:port`）：
+
+```bash
+export REDIS_TYPE=cluster
+export REDIS_PASSWORD=              # 集群无密码时留空
+
+java -jar agent-search-runtime-*.jar \
+  --spring.profiles.active=redis-checkpointer \
+  --openjiuwen.service.middleware.redis.default.nodes[0]=<host>:7001 \
+  --openjiuwen.service.middleware.redis.default.nodes[1]=<host>:7002 \
+  --openjiuwen.service.middleware.redis.default.nodes[2]=<host>:7003 \
+  --openjiuwen.service.middleware.redis.default.nodes[3]=<host>:7004 \
+  --openjiuwen.service.middleware.redis.default.nodes[4]=<host>:7005 \
+  --openjiuwen.service.middleware.redis.default.nodes[5]=<host>:7006
+```
+
+`deep-research-runtime` 同理。集群模式下 `REDIS_HOST` / `REDIS_PORT` / `REDIS_DB` 无效（`database` 会打出 `databaseIgnored=` 警告并被忽略），nodes 列表才是权威来源；节点数量、host:port 格式由 runtime 侧 `RedisConnectionAssembler` 校验，任一节点缺失或格式非法都会 fail-fast 阻止 Spring Boot 启动。
 
 启动后每个进程的日志里应能 grep 到一行 `RedisDatasourceDiagnostics` 输出，形如：
 

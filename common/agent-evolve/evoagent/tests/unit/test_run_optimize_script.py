@@ -334,6 +334,22 @@ def test_run_optimize_managed_doc_kind_strips_whitespace() -> None:
     assert request.managed_doc_kind == "agent_rule"
 
 
+def test_run_optimize_managed_doc_kind_pure_whitespace_treated_as_absent() -> None:
+    """纯空白 managed_doc_kind 视为未提供（回退现有 skill 路径）。
+
+    P2#6：(x or "").strip() or None 对纯空白 "   " → None（与叶子 types.py 一致），
+    避免纯空白穿透 both-absent 门触发无目标 eval-only 路径。
+    """
+    args = _make_args(managed_doc_kind="   ")
+    config = _make_config()
+
+    with patch.object(_run_optimize, "ScenarioRegistry") as mock_reg:
+        mock_reg.return_value.load_scenario_config.return_value = config
+        request = resolve_params(args)
+
+    assert request.managed_doc_kind is None
+
+
 def test_run_optimize_no_managed_doc_kind_uses_existing_skill_path() -> None:
     """不传 --managed-doc-kind 时现有 Skill 路径不变（不回归）。"""
     args = _make_args()  # managed_doc_kind=None

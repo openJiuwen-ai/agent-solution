@@ -157,7 +157,7 @@ def _normalize(api_req: OptimizeAPIRequest, config: EvolveConfig) -> InternalOpt
     # XOR 由路由层 _validate_xor 双保险收口（both-present / both-absent 均拒绝）；
     # 此处仅做归一：managed-doc 模式下 skills 强制为空（走 F7 builder 分支）。
     managed_doc_kind_raw = api_req.managed_doc_kind
-    managed_doc_kind = managed_doc_kind_raw.strip() if managed_doc_kind_raw else None
+    managed_doc_kind = (managed_doc_kind_raw or "").strip() or None
     skills = [] if managed_doc_kind is not None else list(api_req.skills)
 
     return InternalOptimizeRequest(
@@ -234,7 +234,7 @@ async def start_optimize(api_request: OptimizeAPIRequest) -> JobResponse:
     # 叶子 dataclass 仅拒绝 both-present（保留 runner eval-only 空路径），入口层
     # 收口 both-absent（API 无目标即拒绝，422）。strip 后空白视为未提供。
     md_kind_raw = api_request.managed_doc_kind
-    md_kind = md_kind_raw.strip() if md_kind_raw else None
+    md_kind = (md_kind_raw or "").strip() or None
     has_skills = bool(api_request.skills)
     has_managed_doc = md_kind is not None
     if has_skills and has_managed_doc:

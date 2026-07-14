@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -29,16 +30,18 @@ def _make_api_request(
     scenario_name: str = "edp_agent",
     train_split: float = 0.8,
     val_split: float = 0.2,
-) -> dict:
+    managed_doc_kind: str | None = None,
+    skills: list[str] | None = None,
+) -> dict[str, Any]:
     """构造合法的嵌套请求 dict。"""
     data_file = tmp_path / dataset_filename
     data_file.write_text("[]", encoding="utf-8")
-    return {
+    body: dict[str, Any] = {
         "task_name": "test-task",
         "agent_name": agent_name,
         "optimizer_type": "skill",
         "dataset_path": str(data_file),
-        "skills": ["skill_a"],
+        "skills": ["skill_a"] if skills is None else skills,
         "optimizer_template": {
             "name": scenario_name,
             "scenario": scenario_name,
@@ -52,6 +55,9 @@ def _make_api_request(
             "prompt": "评估回答质量",
         },
     }
+    if managed_doc_kind is not None:
+        body["managed_doc_kind"] = managed_doc_kind
+    return body
 
 
 @pytest.fixture
@@ -108,6 +114,24 @@ async def test_start_optimize_missing_dataset_path(
     """缺少 dataset_path → 422。"""
     body = _make_api_request(tmp_path=tmp_path)
     del body["dataset_path"]
+    with patch(
+        "evo_agent.api.routes.optimize.EvolveConfig.get",
+        return_value=config_with_adapter,
+    ):
+        resp = await client.post("/optimize", json=body)
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_start_optimize_pure_whitespace_managed_doc_kind_is_both_absent(
+    client: AsyncClient, tmp_path: Path, config_with_adapter: EvolveConfig
+) -> None:
+    """纯空白 managed_doc_kind + 空 skills → 422 both-absent（P2#5）。
+
+    (x or "").strip() or None 对纯空白 "   " → None，路由 XOR 校验视为未提供，
+    与空 skills 一同触发 both-absent 422，避免穿透触发无目标 eval-only 路径。
+    """
+    body = _make_api_request(tmp_path=tmp_path, managed_doc_kind="   ", skills=[])
     with patch(
         "evo_agent.api.routes.optimize.EvolveConfig.get",
         return_value=config_with_adapter,

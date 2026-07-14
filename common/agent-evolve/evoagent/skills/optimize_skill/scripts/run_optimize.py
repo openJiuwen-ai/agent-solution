@@ -116,7 +116,7 @@ def resolve_params(args: argparse.Namespace) -> OptimizeRequest:
     # skills 强制为空（禁止 scenario skill fallback），managed_doc_kind 只 strip 不
     # 小写化（adapter 精确匹配），空白视为未提供。
     managed_doc_raw = getattr(args, "managed_doc_kind", None)
-    managed_doc_kind = managed_doc_raw.strip() if managed_doc_raw else None
+    managed_doc_kind = (managed_doc_raw or "").strip() or None
     if managed_doc_kind is not None:
         skills: list[str] = []
     elif args.skills is not None:

@@ -432,9 +432,7 @@ def test_resource_resolver_is_protocol() -> None:
 # ── managed-doc API（spec F3）──
 
 
-def _make_managed_doc_api_request(
-    *, tmp_path: Path, scenario_name: str = "edp_agent"
-) -> dict:
+def _make_managed_doc_api_request(*, tmp_path: Path, scenario_name: str = "edp_agent") -> dict:
     """构造 managed-doc 请求：managed_doc_kind + skills=[]（走 F7 builder 分支）。"""
     data_file = tmp_path / "items.json"
     data_file.write_text("[]", encoding="utf-8")

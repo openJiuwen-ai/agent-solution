@@ -2438,8 +2438,7 @@ def test_analyst_prompt_includes_agent_rule_semantics_when_managed_doc_target(
     assert "Target type: agent runtime rule document" in prompt
     assert "Scope: applies globally to every conversation" in prompt
     assert (
-        "Constraints: preserve identity, safety, tool-policy and mandatory business rules"
-        in prompt
+        "Constraints: preserve identity, safety, tool-policy and mandatory business rules" in prompt
     )
     # 标题切换
     assert "## Current Agent Rule Document" in prompt

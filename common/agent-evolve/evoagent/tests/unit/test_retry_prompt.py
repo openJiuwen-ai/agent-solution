@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from evo_agent.llm.invocation import (
     LLMInvocation,
+    LLMInvocationContext,
     LLMProviderCapabilities,
 )
 from evo_agent.optimizer.llm_resilience import (
@@ -127,6 +128,41 @@ async def test_invoke_without_retry_prompt_retries_same_budgeted_prompt() -> Non
     with pytest.raises(Exception):  # noqa: PT011 — build_error 抛业务异常
         await invoke_text_with_retry(invocation, "model", full_prompt, policy=policy)
     assert call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_optimizer_helper_forwards_structured_output_contract() -> None:
+    """Optimizer helper forwards validator, classifier, schema and invocation context."""
+    llm = MagicMock()
+    llm.invoke = AsyncMock(
+        side_effect=[
+            MagicMock(content='{"edits":'),
+            MagicMock(content='{"edits": []}'),
+        ]
+    )
+    invocation = _invocation(llm)
+    policy = LLMInvokePolicy(
+        attempt_timeout_secs=90,
+        total_budget_secs=300,
+        max_attempts=2,
+        backoff_base_secs=0,
+    )
+    classifications: list[str] = []
+
+    raw = await invoke_text_with_retry(
+        invocation,
+        "model",
+        "full",
+        policy=policy,
+        retry_prompt="return edits JSON",
+        result_validator=lambda text: text == '{"edits": []}',
+        result_error_classifier=lambda text: classifications.append(text) or "syntax",
+        output_schema_name="merge_final",
+        context=LLMInvocationContext(run_id="run-1", operator_id="op-1"),
+    )
+
+    assert raw == '{"edits": []}'
+    assert classifications == ['{"edits":']
 
 
 @pytest.mark.asyncio

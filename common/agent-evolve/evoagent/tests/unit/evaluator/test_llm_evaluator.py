@@ -635,30 +635,26 @@ class TestLLMErrorHandling:
         # per_metric may be empty or None since no dimensions were provided
         assert result.per_metric is None or result.per_metric == {}
 
-    def test_invalid_dimension_values_not_in_per_metric(self) -> None:
-        """非法维度值被静默跳过，不进入 per_metric。"""
+    def test_invalid_dimension_values_are_rejected(self) -> None:
+        """已出现的非法维度值触发 schema retry，耗尽后拒绝整份响应。"""
         evaluator = _make_evaluator()
         data = {
             "task_completion": "high",
             "trajectory_quality": 0.8,
-            "safety": float("nan"),
+            "safety": 0.5,
             "score": 0.75,
             "is_pass": True,
             "attributed_skill": "",
             "reason": "some dims invalid",
         }
         response = f"```json\n{json.dumps(data)}\n```"
-        case = _make_case()
-        result = _run_evaluate(
-            evaluator,
-            predict={"answer": "42"},
-            case=case,
-            llm_response=response,
-        )
-        assert result.per_metric is not None
-        assert "task_completion" not in result.per_metric  # string value, skipped
-        assert result.per_metric["trajectory_quality"] == 0.8  # valid
-        assert "safety" not in result.per_metric  # NaN, skipped
+        with pytest.raises(EvaluationError, match="finite number"):
+            _run_evaluate(
+                evaluator,
+                predict={"answer": "42"},
+                case=_make_case(),
+                llm_response=response,
+            )
 
 
 class TestBatchEvaluate:
@@ -709,6 +705,35 @@ class TestBatchEvaluate:
         evaluator = _make_evaluator()
         results = evaluator.batch_evaluate([], [])
         assert results == []
+
+    def test_batch_failure_artifact_does_not_expose_invalid_field_value(self) -> None:
+        evaluator = _make_evaluator()
+        secret = "sensitive-model-field-value"
+        response = json.dumps(
+            {
+                "score": secret,
+                "is_pass": True,
+                "reason": "invalid score type",
+                "attributed_skill": "",
+            }
+        )
+        mock_response = type("Response", (), {"content": response, "metadata": {}})()
+
+        with (
+            patch.object(
+                evaluator._model,
+                "invoke",
+                new_callable=AsyncMock,
+                return_value=mock_response,
+            ),
+            patch("evo_agent.llm.invocation.asyncio.sleep", new_callable=AsyncMock),
+        ):
+            result = evaluator.batch_evaluate_detailed([_make_case()], [{"answer": "42"}])
+
+        failure = result.outcomes[0].failure
+        assert failure is not None
+        assert failure.category == "field_type"
+        assert secret not in failure.safe_message
 
     def test_mean_score_filters_nan_safety_net(self) -> None:
         """_mean_score 防御性过滤 NaN。"""
@@ -895,8 +920,8 @@ class TestParseResult:
         assert result["safety"] == 0.75
         assert "trajectory_quality" not in result  # missing, not in per_metric
 
-    def test_parse_result_nan_dimension_skipped(self) -> None:
-        """NaN 维度值被跳过。"""
+    def test_parse_result_nan_dimension_is_rejected(self) -> None:
+        """NaN 维度值违反 evaluator schema。"""
         evaluator = _make_evaluator()
         data = {
             "task_completion": 0.5,
@@ -908,25 +933,25 @@ class TestParseResult:
             "reason": "test",
         }
         response = f"```json\n{json.dumps(data)}\n```"
-        result = evaluator._parse_result(response)
-        assert result["task_completion"] == 0.5
-        assert "trajectory_quality" not in result  # NaN, skipped
-        assert result["safety"] == 0.75
+        with pytest.raises(EvaluationError, match="invalid JSON syntax"):
+            evaluator._parse_result(response)
 
     def test_parse_result_non_numeric_score_raises(self) -> None:
         """非数值 score 必须报错。"""
         evaluator = _make_evaluator()
-        data = {"score": "high", "is_pass": True, "reason": "ok"}
+        secret = "sensitive-model-field-value"
+        data = {"score": secret, "is_pass": True, "reason": "ok"}
         response = f"```json\n{json.dumps(data)}\n```"
-        with pytest.raises(EvaluationError, match="missing valid 'score'"):
+        with pytest.raises(EvaluationError, match="missing valid 'score'") as exc_info:
             evaluator._parse_result(response)
+        assert secret not in exc_info.value.safe_message
 
     def test_parse_result_nan_score_raises(self) -> None:
         """NaN score 必须报错。"""
         evaluator = _make_evaluator()
         data = {"score": float("nan"), "is_pass": True, "reason": "ok"}
         response = f"```json\n{json.dumps(data)}\n```"
-        with pytest.raises(EvaluationError, match="non-finite"):
+        with pytest.raises(EvaluationError, match="invalid JSON syntax"):
             evaluator._parse_result(response)
 
     def test_parse_result_inf_score_raises(self) -> None:
@@ -934,7 +959,7 @@ class TestParseResult:
         evaluator = _make_evaluator()
         data = {"score": float("inf"), "is_pass": True, "reason": "ok"}
         response = f"```json\n{json.dumps(data)}\n```"
-        with pytest.raises(EvaluationError, match="non-finite"):
+        with pytest.raises(EvaluationError, match="invalid JSON syntax"):
             evaluator._parse_result(response)
 
     def test_parse_result_non_boolean_is_pass_raises(self) -> None:

@@ -30,10 +30,6 @@ from evo_agent.evaluator.batch_result import (
 from evo_agent.evaluator.domain.models import LLMEvaluationOutput
 from evo_agent.evaluator.domain.scoring import EvaluationError, EvaluationScores
 from evo_agent.evaluator.evaluators.base import EvaluateInputMixin
-from evo_agent.evaluator.json_util import (
-    JsonRepairPolicy,
-    extract_json,
-)
 from evo_agent.evaluator.prompts.formatter import (
     build_dimension_keys,
     format_evaluation_prompt,
@@ -49,6 +45,11 @@ from evo_agent.llm.invocation import (
     LLMInvocationRequest,
     LLMProviderCapabilities,
     LLMRetryPolicy,
+)
+from evo_agent.llm.structured_output import (
+    StructuredOutputPolicy,
+    ValidationResult,
+    parse_structured_output,
 )
 from evo_agent.llm.trajectory_compaction import (
     TrajectoryCompactionContext,
@@ -71,6 +72,11 @@ _EVALUATOR_JSON_KEYS = frozenset(
         "attributed_skill",
         "reason",
     }
+)
+_EVALUATOR_POLICY = StructuredOutputPolicy(
+    schema_name="llm_evaluation",
+    required_keys=frozenset({"reason"}),
+    allowed_comma_next_keys=_EVALUATOR_JSON_KEYS,
 )
 
 
@@ -223,6 +229,14 @@ class LLMEvaluator(EvaluateInputMixin, BaseEvaluator):  # type: ignore[misc]
                 return False
             return True
 
+        def _result_error_category(text: str) -> str | None:
+            try:
+                parsed = self._parse_result(text, enable_attribution=enable_attribution)
+                _validate_attributed_skill(parsed.attributed_skill, skill_names)
+            except EvaluationError as error:
+                return error.category
+            return None
+
         retry_prompt = _build_format_retry_prompt(prompt, enable_attribution)
         try:
             result = self._invocation.invoke_sync(
@@ -231,6 +245,7 @@ class LLMEvaluator(EvaluateInputMixin, BaseEvaluator):  # type: ignore[misc]
                     messages=(UserMessage(content=prompt),),
                     retry_messages=(UserMessage(content=retry_prompt),),
                     result_validator=_result_is_valid,
+                    result_error_classifier=_result_error_category,
                     context=LLMInvocationContext(run_id="evaluator", case_id=case.case_id),
                     retry_policy=LLMRetryPolicy(2, 120.0, 300.0, 1.0, 0.0),
                     output_schema_name="llm_evaluation",
@@ -455,21 +470,24 @@ class LLMEvaluator(EvaluateInputMixin, BaseEvaluator):  # type: ignore[misc]
             EvaluationError: when JSON extraction fails, the response is not
                 a dict, or essential fields are missing/invalid.
         """
-        extraction = extract_json(
-            response,
-            policy=JsonRepairPolicy(
-                allow_single_missing_comma=True,
-                allowed_comma_next_keys=_EVALUATOR_JSON_KEYS,
-                required_keys=frozenset(
-                    {"reason", "attributed_skill"} if enable_attribution else {"reason"}
-                ),
+        policy = StructuredOutputPolicy(
+            schema_name=_EVALUATOR_POLICY.schema_name,
+            allow_single_missing_comma=_EVALUATOR_POLICY.allow_single_missing_comma,
+            allowed_comma_next_keys=_EVALUATOR_POLICY.allowed_comma_next_keys,
+            required_keys=frozenset(
+                {"reason", "attributed_skill"} if enable_attribution else {"reason"}
             ),
         )
+        extraction = parse_structured_output(
+            response,
+            policy=policy,
+            validator=_validate_evaluator_output,
+        )
         data = extraction.data
-        if not isinstance(data, dict):
+        if data is None:
             digest = hashlib.sha256(response.encode("utf-8")).hexdigest()
             raise EvaluationError(
-                category="json_parse_error",
+                category=extraction.error_category or "json_parse_error",
                 safe_message=f"Failed to extract JSON from evaluator response: {extraction.error}",
                 response_sha256=digest,
                 response_chars=len(response),
@@ -477,16 +495,12 @@ class LLMEvaluator(EvaluateInputMixin, BaseEvaluator):  # type: ignore[misc]
             )
 
         # --- Essential field validation (critical path) ---
-        raw_score = data.get("score")
-        if not isinstance(raw_score, (int, float)):
-            raise EvaluationError(f"LLM response missing valid 'score' field: {raw_score!r}")
-        if not math.isfinite(raw_score):
-            raise EvaluationError(f"LLM response 'score' has non-finite value: {raw_score!r}")
+        raw_score = data["score"]
+        assert isinstance(raw_score, (int, float)) and not isinstance(raw_score, bool)
         score = max(0.0, min(1.0, float(raw_score)))
 
-        raw_is_pass = data.get("is_pass")
-        if not isinstance(raw_is_pass, bool):
-            raise EvaluationError(f"LLM response missing valid 'is_pass' field: {raw_is_pass!r}")
+        raw_is_pass = data["is_pass"]
+        assert isinstance(raw_is_pass, bool)
         is_pass = raw_is_pass
 
         attributed_skill = data.get("attributed_skill", "")
@@ -526,6 +540,47 @@ class LLMEvaluator(EvaluateInputMixin, BaseEvaluator):  # type: ignore[misc]
             ),
             repaired_response=extraction.repaired_text,
         )
+
+
+def _validate_evaluator_output(data: dict[str, Any]) -> ValidationResult:
+    raw_score = data.get("score")
+    if isinstance(raw_score, bool) or not isinstance(raw_score, (int, float)):
+        return ValidationResult(
+            False,
+            "field_type",
+            "LLM response missing valid 'score' field",
+        )
+    if not math.isfinite(raw_score):
+        return ValidationResult(
+            False,
+            "field_type",
+            "LLM response 'score' has non-finite value",
+        )
+    raw_is_pass = data.get("is_pass")
+    if not isinstance(raw_is_pass, bool):
+        return ValidationResult(
+            False,
+            "field_type",
+            "LLM response missing valid 'is_pass' field",
+        )
+    if not isinstance(data.get("reason"), str):
+        return ValidationResult(False, "field_type", "reason must be a string")
+    attributed_skill = data.get("attributed_skill", "")
+    if not isinstance(attributed_skill, str):
+        return ValidationResult(False, "field_type", "attributed_skill must be a string")
+    for dimension in _DIM_KEYS:
+        value = data.get(dimension)
+        if value is not None and (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+        ):
+            return ValidationResult(
+                False,
+                "field_type",
+                f"{dimension} must be a finite number",
+            )
+    return ValidationResult(True)
 
 
 def _inject_custom_instruction(custom_instruction: str) -> str:
@@ -631,13 +686,18 @@ def _log_json_repair(
     metadata = getattr(result, "metadata", {})
     diagnostics = dict(metadata) if isinstance(metadata, Mapping) else {}
     logger.warning(
-        "JSON repaired case_id=%s invocation_id=%s stage=evaluator provider=%s "
-        "parse_mode=%s repair_operations=%s original_response=%s repaired_response=%s",
+        "JSON repaired case_id=%s invocation_id=%s stage=evaluator "
+        "schema_name=llm_evaluation attempt=%s provider=%s parse_mode=%s "
+        "repair_operations=%s finish_reason=%s transport_complete=%s "
+        "original_response=%s repaired_response=%s",
         case_id,
         getattr(result, "invocation_id", None) or "unknown",
+        diagnostics.get("attempt", "unknown"),
         diagnostics.get("provider", "unknown"),
         scores.parse_mode,
         json.dumps(scores.repair_operations, ensure_ascii=False),
+        getattr(result, "finish_reason", None) or "unknown",
+        getattr(result, "transport_complete", "unknown"),
         json.dumps(response, ensure_ascii=False),
         json.dumps(scores.repaired_response or "", ensure_ascii=False),
     )

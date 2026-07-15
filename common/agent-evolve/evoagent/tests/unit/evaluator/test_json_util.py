@@ -1,6 +1,11 @@
 """共享 JSON 提取与确定性修复行为测试。"""
 
 from evo_agent.evaluator.json_util import JsonRepairPolicy, extract_json
+from evo_agent.llm.structured_output import StructuredOutputPolicy
+
+
+def test_legacy_policy_name_reexports_the_unified_policy() -> None:
+    assert JsonRepairPolicy is StructuredOutputPolicy
 
 
 def test_extract_json_repairs_code_fence_and_trailing_comma() -> None:

@@ -17,20 +17,38 @@ from evo_agent.evaluator.domain.models import (
     GoalGenerationOutput,
 )
 from evo_agent.evaluator.domain.scoring import EvaluationError
-from evo_agent.evaluator.json_util import JsonRepairPolicy, extract_json
 from evo_agent.evaluator.prompts.goal_generation import GOAL_GENERATION_PROMPT_TEMPLATE
 from evo_agent.llm.invocation import (
     LLMInvocation,
     LLMInvocationContext,
+    LLMInvocationError,
     LLMInvocationRequest,
     LLMProviderCapabilities,
     LLMRetryPolicy,
+)
+from evo_agent.llm.structured_output import (
+    StructuredOutputPolicy,
+    StructuredOutputResult,
+    ValidationResult,
+    log_structured_output,
+    parse_structured_output,
 )
 from evo_agent.llm.trajectory_compaction import (
     TrajectoryCompactionContext,
     TrajectoryCompactionError,
     TrajectoryCompactionPolicy,
     compact_trajectory,
+)
+
+_GOAL_POLICY = StructuredOutputPolicy(
+    schema_name="goal_generation",
+    required_keys=frozenset({"goal"}),
+    allowed_comma_next_keys=frozenset({"goal", "reason", "confidence"}),
+)
+_GOAL_FORMAT_RETRY_INSTRUCTION = (
+    "格式重试：请依据下方轨迹证据重新提炼真实目标，只输出一个合法 JSON 对象。"
+    "对象必须包含 goal 字符串，可包含 reason 字符串和 confidence 有限数值。"
+    "不要照抄字段说明；禁止 Markdown、code fence、注释、NaN 或 Infinity。"
 )
 
 
@@ -76,12 +94,23 @@ class TrajectoryGoalGenerator:
                 safe_message=f"Goal trajectory cannot fit prompt budget: {exc}",
             ) from exc
         prompt = GOAL_GENERATION_PROMPT_TEMPLATE.replace("{messages}", compacted.text)
+        retry_prompt = f"{_GOAL_FORMAT_RETRY_INSTRUCTION}\n\n轨迹证据：\n{compacted.text}"
+
+        def parse(text: str) -> StructuredOutputResult:
+            return parse_structured_output(
+                text,
+                policy=_GOAL_POLICY,
+                validator=_validate_goal_output,
+            )
 
         try:
             result = self._invocation.invoke_sync(
                 LLMInvocationRequest(
                     stage="goal_generator",
                     messages=(UserMessage(content=prompt),),
+                    retry_messages=(UserMessage(content=retry_prompt),),
+                    result_validator=lambda text: parse(text).data is not None,
+                    result_error_classifier=lambda text: parse(text).error_category,
                     context=LLMInvocationContext(run_id="goal_generator"),
                     retry_policy=LLMRetryPolicy(2, 120.0, 300.0, 1.0, 0.0),
                     output_schema_name="goal_generation",
@@ -90,8 +119,29 @@ class TrajectoryGoalGenerator:
             )
             response = result.text
         except Exception as e:
+            if isinstance(e, LLMInvocationError) and e.category == "unusable_response":
+                message = (
+                    "LLM response missing valid 'goal' field"
+                    if e.output_error_category == "required_key"
+                    else "Failed to extract JSON from LLM goal response"
+                )
+                raise EvaluationError(
+                    category=e.output_error_category or "json_parse_error",
+                    safe_message=message,
+                ) from e
             raise EvaluationError(f"LLM goal generation failed: {e}") from e
 
+        final_extraction = parse(response)
+        if final_extraction.data is not None:
+            log_structured_output(
+                final_extraction,
+                stage="goal_generator",
+                schema_name=_GOAL_POLICY.schema_name,
+                invocation_id=result.invocation_id,
+                attempt=result.metadata.get("attempt", "unknown"),
+                finish_reason=result.finish_reason or "unknown",
+                transport_complete=result.transport_complete,
+            )
         data = _parse_goal_response(response)
         goal = data["goal"]
 
@@ -108,16 +158,37 @@ class TrajectoryGoalGenerator:
 
 
 def _parse_goal_response(response: str) -> dict[str, Any]:
-    try:
-        data = extract_json(response, policy=JsonRepairPolicy()).data
-    except Exception as e:
-        raise EvaluationError(f"Failed to extract JSON from LLM response: {e}") from e
+    extraction = parse_structured_output(
+        response,
+        policy=_GOAL_POLICY,
+        validator=_validate_goal_output,
+    )
+    data = extraction.data
+    if data is None:
+        if extraction.error_category == "field_type" and "goal" in extraction.error:
+            message = "LLM response missing valid 'goal' field"
+        else:
+            message = f"Failed to extract JSON from LLM response: {extraction.error}"
+        raise EvaluationError(
+            category=extraction.error_category or "json_parse_error",
+            safe_message=message,
+        )
 
-    if not isinstance(data, dict):
-        raise EvaluationError(f"Failed to extract JSON from LLM response: {response[:200]}")
-
-    goal = data.get("goal")
-    if not isinstance(goal, str) or not goal.strip():
-        raise EvaluationError(f"LLM response missing valid 'goal' field: {goal!r}")
+    goal = data["goal"]
+    assert isinstance(goal, str)
     data["goal"] = goal.strip()
     return data
+
+
+def _validate_goal_output(data: dict[str, Any]) -> ValidationResult:
+    goal = data.get("goal")
+    if not isinstance(goal, str) or not goal.strip():
+        return ValidationResult(False, "field_type", "goal must be a non-empty string")
+    confidence = data.get("confidence")
+    if confidence is not None and (
+        isinstance(confidence, bool)
+        or not isinstance(confidence, (int, float))
+        or not math.isfinite(confidence)
+    ):
+        return ValidationResult(False, "field_type", "confidence must be a finite number")
+    return ValidationResult(True)

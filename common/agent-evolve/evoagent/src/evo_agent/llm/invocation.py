@@ -56,6 +56,7 @@ class LLMInvocationRequest:
     retry_policy: LLMRetryPolicy
     retry_messages: tuple[BaseMessage, ...] | None = None
     result_validator: Callable[[str], bool] | None = None
+    result_error_classifier: Callable[[str], str | None] | None = None
     output_schema_name: str | None = None
     reserved_output_tokens: int | None = None
 
@@ -140,11 +141,13 @@ class LLMInvocationError(Exception):
         safe_message: str,
         *,
         result: LLMInvocationResult | None = None,
+        output_error_category: str | None = None,
     ) -> None:
         super().__init__(safe_message)
         self.category = category
         self.safe_message = safe_message
         self.result = result
+        self.output_error_category = output_error_category
 
 
 class PromptBudgetExceededError(LLMInvocationError):
@@ -253,28 +256,39 @@ class LLMInvocation:
                 )
                 if not result.transport_complete:
                     raise LLMInvocationError(
-                        "transport_incomplete", "provider response was incomplete"
+                        "transport_incomplete",
+                        "provider response was incomplete",
+                        result=result,
                     )
                 if result.finish_reason == "length":
                     raise LLMInvocationError(
-                        "finish_reason_length", "provider output reached its length limit"
+                        "finish_reason_length",
+                        "provider output reached its length limit",
+                        result=result,
                     )
                 if not result.text.strip():
-                    raise LLMInvocationError("empty_response", "provider returned empty output")
+                    raise LLMInvocationError(
+                        "empty_response",
+                        "provider returned empty output",
+                        result=result,
+                    )
                 if request.result_validator is not None and not request.result_validator(
                     result.text
                 ):
+                    output_error_category = _classify_result_error(request, result.text)
                     raise LLMInvocationError(
                         "unusable_response",
                         "provider returned unusable structured output",
                         result=result,
+                        output_error_category=output_error_category,
                     )
                 logger.info(
                     "LLM attempt completed invocation_id=%s stage=%s attempt=%s "
-                    "latency_ms=%d finish_reason=%s transport_complete=%s",
+                    "schema_name=%s latency_ms=%d finish_reason=%s transport_complete=%s",
                     invocation_id,
                     request.stage,
                     attempt,
+                    request.output_schema_name or "none",
                     round((time.monotonic() - attempt_started) * 1000),
                     result.finish_reason or "unknown",
                     result.transport_complete,
@@ -292,12 +306,25 @@ class LLMInvocation:
                 )
                 logger.warning(
                     "LLM attempt failed invocation_id=%s stage=%s attempt=%s "
-                    "latency_ms=%d category=%s retryable=%s",
+                    "schema_name=%s latency_ms=%d category=%s "
+                    "output_error_category=%s finish_reason=%s transport_complete=%s retryable=%s",
                     invocation_id,
                     request.stage,
                     attempt,
+                    request.output_schema_name or "none",
                     round((time.monotonic() - attempt_started) * 1000),
                     _declared_category(exc) or type(exc).__name__,
+                    getattr(exc, "output_error_category", None) or "none",
+                    (
+                        exc.result.finish_reason or "unknown"
+                        if isinstance(exc, LLMInvocationError) and exc.result is not None
+                        else "unknown"
+                    ),
+                    (
+                        exc.result.transport_complete
+                        if isinstance(exc, LLMInvocationError) and exc.result is not None
+                        else "unknown"
+                    ),
                     retryable,
                 )
                 if attempt >= attempts or not retryable:
@@ -442,6 +469,21 @@ def _is_retryable(exc: Exception) -> bool:
 def _declared_category(exc: Exception) -> str | None:
     category = getattr(exc, "category", None)
     return category if isinstance(category, str) and category else None
+
+
+def _classify_result_error(request: LLMInvocationRequest, text: str) -> str | None:
+    if request.result_error_classifier is None:
+        return None
+    try:
+        return request.result_error_classifier(text)
+    except Exception:
+        logger.warning(
+            "LLM result classifier failed stage=%s schema_name=%s",
+            request.stage,
+            request.output_schema_name or "none",
+            exc_info=True,
+        )
+        return None
 
 
 __all__ = [

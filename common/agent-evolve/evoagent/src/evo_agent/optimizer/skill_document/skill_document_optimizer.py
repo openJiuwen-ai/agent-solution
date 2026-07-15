@@ -18,6 +18,7 @@ import json
 import math
 import random
 import time
+from collections.abc import Callable
 from dataclasses import asdict, replace
 from typing import TYPE_CHECKING, Any, cast
 
@@ -38,12 +39,18 @@ from evo_agent.evaluator.batch_result import (
     EvaluationFailure,
     EvaluationOutcome,
 )
-from evo_agent.evaluator.json_util import JsonRepairPolicy, extract_json
 from evo_agent.llm.invocation import (
     LLMInvocation,
+    LLMInvocationContext,
+    LLMInvocationError,
     LLMInvocationResult,
     LLMProviderCapabilities,
     PromptBudgetExceededError,
+)
+from evo_agent.llm.structured_output import (
+    StructuredOutputResult,
+    log_structured_output,
+    parse_structured_output,
 )
 from evo_agent.llm.trajectory_compaction import (
     TrajectoryCompactionContext,
@@ -58,6 +65,20 @@ from evo_agent.optimizer.skill_document.artifact_exporter import ArtifactExporte
 from evo_agent.optimizer.skill_document.edit_apply import apply_patch_with_report
 from evo_agent.optimizer.skill_document.prompts import load_skill_opt_prompt
 from evo_agent.optimizer.skill_document.scheduler import build_scheduler
+from evo_agent.optimizer.skill_document.structured_validators import (
+    MERGE_FAILURE_POLICY,
+    MERGE_FINAL_POLICY,
+    MERGE_SUCCESS_POLICY,
+    RANKING_POLICY,
+    REFLECT_FAILURE_POLICY,
+    REFLECT_SUCCESS_POLICY,
+    reflect_patch_data,
+    valid_edit_items,
+    valid_selected_indices,
+    validate_merge_output,
+    validate_ranking_output,
+    validate_reflect_output,
+)
 from evo_agent.optimizer.skill_document.types import (
     AttributedBatch,
     Edit,
@@ -87,6 +108,50 @@ def _dumps_for_prompt(data: Any) -> str:
     仍用 ``indent=2, ensure_ascii=False``。
     """
     return json.dumps(data, ensure_ascii=False, indent=None, separators=(",", ":"))
+
+
+def _safe_int(value: Any) -> int:
+    """Coerce optional model metadata without letting one bad edit reject its siblings."""
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _string_tuple(value: Any, default: tuple[str, ...]) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)):
+        return default
+    return tuple(item for item in value if isinstance(item, str))
+
+
+def _log_failed_structured_invocation(
+    exc: Exception,
+    *,
+    stage: str,
+    schema_name: str,
+    fallback: str,
+    parse: Callable[[str], StructuredOutputResult],
+) -> bool:
+    """Log the final validator-rejected attempt with parser provenance."""
+    if (
+        not isinstance(exc, LLMInvocationError)
+        or exc.category != "unusable_response"
+        or exc.result is None
+    ):
+        return False
+    result = exc.result
+    extraction = parse(result.text)
+    log_structured_output(
+        extraction,
+        stage=stage,
+        schema_name=schema_name,
+        invocation_id=result.invocation_id,
+        attempt=result.metadata.get("attempt", "unknown"),
+        finish_reason=result.finish_reason or "unknown",
+        transport_complete=result.transport_complete,
+        fallback=fallback,
+    )
+    return True
 
 
 # A8 (#17): tightened timeouts so retry triggers earlier on large cases.
@@ -946,6 +1011,17 @@ class SkillDocumentOptimizer(BaseOptimizer):  # type: ignore[misc]
             tasks.append(("success", success_prompt, success_retry))
 
         async def run_analyst(source_type: str, prompt: str, retry_prompt: str) -> RawPatch | None:
+            structured_policy = (
+                REFLECT_FAILURE_POLICY if source_type == "failure" else REFLECT_SUCCESS_POLICY
+            )
+
+            def parse(text: str) -> StructuredOutputResult:
+                return parse_structured_output(
+                    text,
+                    policy=structured_policy,
+                    validator=validate_reflect_output,
+                )
+
             try:
                 invocation = await invoke_with_retry(
                     self._llm,
@@ -953,7 +1029,19 @@ class SkillDocumentOptimizer(BaseOptimizer):  # type: ignore[misc]
                     prompt,
                     policy=_REFLECT_POLICY,
                     stage="reflect",
-                    retry_prompt=retry_prompt,
+                    retry_prompt=(
+                        f"{retry_prompt}\n\n格式重试：只输出符合 {structured_policy.schema_name} "
+                        'schema 的 JSON 对象：{"patch":{"reasoning":"...","edits":[]}}。'
+                    ),
+                    result_validator=lambda text: parse(text).data is not None,
+                    result_error_classifier=lambda text: parse(text).error_category,
+                    output_schema_name=structured_policy.schema_name,
+                    context=LLMInvocationContext(
+                        run_id="optimizer",
+                        operator_id=operator_id or None,
+                        epoch=getattr(self, "_current_epoch", None),
+                        step=getattr(self, "_global_step", None),
+                    ),
                 )
                 return self._parse_reflect_response(
                     invocation,
@@ -962,11 +1050,19 @@ class SkillDocumentOptimizer(BaseOptimizer):  # type: ignore[misc]
                     source_ids=source_ids,
                 )
             except Exception as exc:
-                logger.warning(
-                    "[skill_doc_opt] reflect %s failed: %s",
-                    source_type,
+                logged = _log_failed_structured_invocation(
                     exc,
+                    stage="reflect",
+                    schema_name=structured_policy.schema_name,
+                    fallback="discard_patch",
+                    parse=parse,
                 )
+                if not logged:
+                    logger.warning(
+                        "[skill_doc_opt] reflect %s failed: %s",
+                        source_type,
+                        exc,
+                    )
                 return None
 
         results = await asyncio.gather(*[run_analyst(st, p, rp) for st, p, rp in tasks])
@@ -1020,54 +1116,81 @@ class SkillDocumentOptimizer(BaseOptimizer):  # type: ignore[misc]
     ) -> RawPatch | None:
         """Parse and validate an analyst LLM response into a RawPatch."""
         raw = response.text if isinstance(response, LLMInvocationResult) else response
-        extraction = extract_json(raw, policy=JsonRepairPolicy())
+        structured_policy = (
+            REFLECT_FAILURE_POLICY if source_type == "failure" else REFLECT_SUCCESS_POLICY
+        )
+        extraction = parse_structured_output(
+            raw,
+            policy=structured_policy,
+            validator=validate_reflect_output,
+        )
         result = extraction.data
+        if result is not None:
+            log_structured_output(
+                extraction,
+                stage="reflect",
+                schema_name=structured_policy.schema_name,
+                invocation_id=(
+                    response.invocation_id
+                    if isinstance(response, LLMInvocationResult)
+                    else "unknown"
+                ),
+                attempt=(
+                    response.metadata.get("attempt", "unknown")
+                    if isinstance(response, LLMInvocationResult)
+                    else "unknown"
+                ),
+                finish_reason=(
+                    response.finish_reason or "unknown"
+                    if isinstance(response, LLMInvocationResult)
+                    else "unknown"
+                ),
+                transport_complete=(
+                    response.transport_complete
+                    if isinstance(response, LLMInvocationResult)
+                    else "unknown"
+                ),
+            )
         if result is None:
             logger.warning(
-                "[skill_doc_opt] reflect JSON parse failed source_type=%s operator=%s "
-                "invocation_id=%s stage=reflect prompt_estimated_tokens=%s "
-                "output_reserve_tokens=%s finish_reason=%s raw_response=%s error=%s",
+                "structured output failed stage=reflect schema_name=%s source_type=%s "
+                "operator=%s invocation_id=%s attempt=%s parse_mode=%s "
+                "repair_operations=%s finish_reason=%s transport_complete=%s "
+                "fallback=discard_patch category=%s raw_response=%s",
+                structured_policy.schema_name,
                 source_type,
                 operator_id or "unknown",
                 response.invocation_id if isinstance(response, LLMInvocationResult) else "unknown",
-                response.metadata.get("estimated_input_tokens", "unknown")
+                response.metadata.get("attempt", "unknown")
                 if isinstance(response, LLMInvocationResult)
                 else "unknown",
-                response.metadata.get("output_reserve_tokens", "unknown")
-                if isinstance(response, LLMInvocationResult)
-                else "unknown",
+                extraction.parse_mode,
+                extraction.repair_operations,
                 response.finish_reason if isinstance(response, LLMInvocationResult) else "unknown",
+                response.transport_complete
+                if isinstance(response, LLMInvocationResult)
+                else "unknown",
+                extraction.error_category or "unknown",
                 json.dumps(raw, ensure_ascii=False),
-                extraction.error,
             )
             return None
 
-        if not isinstance(result, dict):
-            return None
-
         # Extract patch from response
-        patch_data = result.get("patch", result)
-        if not isinstance(patch_data, dict):
-            return None
-
-        edits_data = patch_data.get("edits", [])
-        if not isinstance(edits_data, list):
-            return None
+        patch_data = reflect_patch_data(result)
+        edits_data = patch_data["edits"]
+        assert isinstance(edits_data, list)
 
         # R1 validation: filter to valid edits
         valid_edits: list[Edit] = []
-        for ed in edits_data:
-            if not isinstance(ed, dict):
-                continue
-            op = ed.get("op", "")
-            if op not in _VALID_OPS:
-                continue
+        for ed in valid_edit_items(edits_data):
+            op = ed["op"]
+            assert op in _VALID_OPS
             valid_edits.append(
                 Edit(
                     op=op,
                     content=str(ed.get("content", "")),
                     target=str(ed.get("target", "")),
-                    support_count=int(ed.get("support_count", 0) or 0),
+                    support_count=_safe_int(ed.get("support_count")),
                     source_type=source_type,
                     source_ids=source_ids,
                 )
@@ -1269,6 +1392,19 @@ class SkillDocumentOptimizer(BaseOptimizer):  # type: ignore[misc]
         prompt, retry_prompt = self._build_merge_prompts(
             edits, template_name, skill_content, meta_skill_context
         )
+        structured_policy_by_template = {
+            "merge_failure": MERGE_FAILURE_POLICY,
+            "merge_success": MERGE_SUCCESS_POLICY,
+            "merge_final": MERGE_FINAL_POLICY,
+        }
+        structured_policy = structured_policy_by_template[template_name]
+
+        def parse(text: str) -> StructuredOutputResult:
+            return parse_structured_output(
+                text,
+                policy=structured_policy,
+                validator=validate_merge_output,
+            )
 
         try:
             invocation = await invoke_with_retry(
@@ -1277,33 +1413,52 @@ class SkillDocumentOptimizer(BaseOptimizer):  # type: ignore[misc]
                 prompt,
                 policy=_AGGREGATE_POLICY,
                 stage="merge",
-                retry_prompt=retry_prompt,
+                retry_prompt=(
+                    f"{retry_prompt}\n\n格式重试：只输出符合 {structured_policy.schema_name} "
+                    'schema 的 JSON 对象：{"reasoning":"...","edits":[]}。'
+                ),
+                result_validator=lambda text: parse(text).data is not None,
+                result_error_classifier=lambda text: parse(text).error_category,
+                output_schema_name=structured_policy.schema_name,
+                context=LLMInvocationContext(
+                    run_id="optimizer",
+                    epoch=getattr(self, "_current_epoch", None),
+                    step=getattr(self, "_global_step", None),
+                ),
             )
             raw = invocation.text
-            extraction = extract_json(raw, policy=JsonRepairPolicy())
+            extraction = parse(raw)
             result = extraction.data
-            if result and isinstance(result, dict) and "edits" in result:
+            if result is not None:
+                log_structured_output(
+                    extraction,
+                    stage="merge",
+                    schema_name=structured_policy.schema_name,
+                    invocation_id=invocation.invocation_id,
+                    attempt=invocation.metadata.get("attempt", "unknown"),
+                    finish_reason=invocation.finish_reason or "unknown",
+                    transport_complete=invocation.transport_complete,
+                )
+            if result is not None:
                 merged = []
                 input_source_ids = tuple(
                     dict.fromkeys(source_id for edit in edits for source_id in edit.source_ids)
                 )
-                for ed in result["edits"]:
-                    if not isinstance(ed, dict):
-                        continue
-                    op = ed.get("op", "")
-                    if op not in _VALID_OPS:
-                        continue
+                edits_data = result["edits"]
+                assert isinstance(edits_data, list)
+                for ed in valid_edit_items(edits_data):
+                    op = ed["op"]
+                    assert op in _VALID_OPS
                     merged.append(
                         Edit(
                             op=op,
                             content=str(ed.get("content", "")),
                             target=str(ed.get("target", "")),
-                            support_count=int(ed.get("support_count", 0) or 0),
+                            support_count=_safe_int(ed.get("support_count")),
                             source_type=str(ed.get("source_type", "failure")),
-                            source_ids=tuple(
-                                source_id
-                                for source_id in ed.get("source_ids", input_source_ids)
-                                if isinstance(source_id, str)
+                            source_ids=_string_tuple(
+                                ed.get("source_ids", input_source_ids),
+                                input_source_ids,
                             ),
                         )
                     )
@@ -1317,23 +1472,33 @@ class SkillDocumentOptimizer(BaseOptimizer):  # type: ignore[misc]
                     return merged
             if result is None:
                 logger.warning(
-                    "[skill_doc_opt] aggregate JSON parse failed stage=%s "
-                    "invocation_id=%s prompt_estimated_tokens=%s "
-                    "output_reserve_tokens=%s finish_reason=%s error=%s raw_response=%s",
-                    template_name,
+                    "structured output failed stage=merge schema_name=%s invocation_id=%s "
+                    "attempt=%s parse_mode=%s repair_operations=%s finish_reason=%s "
+                    "transport_complete=%s fallback=original_edits category=%s raw_response=%s",
+                    structured_policy.schema_name,
                     invocation.invocation_id,
-                    invocation.metadata.get("estimated_input_tokens", "unknown"),
-                    invocation.metadata.get("output_reserve_tokens", "unknown"),
+                    invocation.metadata.get("attempt", "unknown"),
+                    extraction.parse_mode,
+                    extraction.repair_operations,
                     invocation.finish_reason or "unknown",
-                    extraction.error,
+                    invocation.transport_complete,
+                    extraction.error_category or "unknown",
                     json.dumps(raw, ensure_ascii=False),
                 )
         except Exception as exc:
-            logger.warning(
-                "[skill_doc_opt] aggregate %s failed, using fallback: %s",
-                template_name,
+            logged = _log_failed_structured_invocation(
                 exc,
+                stage="merge",
+                schema_name=structured_policy.schema_name,
+                fallback="original_edits",
+                parse=parse,
             )
+            if not logged:
+                logger.warning(
+                    "[skill_doc_opt] aggregate %s failed, using fallback: %s",
+                    template_name,
+                    exc,
+                )
 
         # Fallback: return original edits unchanged
         return edits
@@ -1398,6 +1563,13 @@ class SkillDocumentOptimizer(BaseOptimizer):  # type: ignore[misc]
         )
         retry_prompt = f"{system}\n\n{slim_user}"
 
+        def parse(text: str) -> StructuredOutputResult:
+            return parse_structured_output(
+                text,
+                policy=RANKING_POLICY,
+                validator=validate_ranking_output,
+            )
+
         try:
             invocation = await invoke_with_retry(
                 self._llm,
@@ -1405,40 +1577,69 @@ class SkillDocumentOptimizer(BaseOptimizer):  # type: ignore[misc]
                 prompt,
                 policy=_RANKING_POLICY,
                 stage="ranking",
-                retry_prompt=retry_prompt,
+                retry_prompt=(f'{retry_prompt}\n仅输出 ranking JSON：{{"selected_indices":[]}}'),
+                result_validator=lambda text: parse(text).data is not None,
+                result_error_classifier=lambda text: parse(text).error_category,
+                output_schema_name=RANKING_POLICY.schema_name,
+                context=LLMInvocationContext(
+                    run_id="optimizer",
+                    epoch=getattr(self, "_current_epoch", None),
+                    step=getattr(self, "_global_step", None),
+                ),
             )
             raw = invocation.text
-            extraction = extract_json(raw, policy=JsonRepairPolicy())
+            extraction = parse(raw)
             result = extraction.data
-            if result and isinstance(result, dict) and "selected_indices" in result:
+            if result is not None:
+                log_structured_output(
+                    extraction,
+                    stage="ranking",
+                    schema_name=RANKING_POLICY.schema_name,
+                    invocation_id=invocation.invocation_id,
+                    attempt=invocation.metadata.get("attempt", "unknown"),
+                    finish_reason=invocation.finish_reason or "unknown",
+                    transport_complete=invocation.transport_complete,
+                )
+            if result is not None:
                 indices = result["selected_indices"]
-                selected: list[Edit] = []
-                seen: set[int] = set()
-                for idx in indices:
-                    if isinstance(idx, int) and 0 <= idx < len(edits) and idx not in seen:
-                        selected.append(edits[idx])
-                        seen.add(idx)
-                    if len(selected) >= budget:
-                        break
+                assert isinstance(indices, list)
+                selected = [
+                    edits[index]
+                    for index in valid_selected_indices(
+                        indices,
+                        pool_size=len(edits),
+                        budget=budget,
+                    )
+                ]
                 if selected:
                     return selected
             if result is None:
                 logger.warning(
-                    "[skill_doc_opt] ranking JSON parse failed invocation_id=%s "
-                    "prompt_estimated_tokens=%s output_reserve_tokens=%s "
-                    "finish_reason=%s error=%s raw_response=%s",
+                    "structured output failed stage=ranking schema_name=ranking invocation_id=%s "
+                    "attempt=%s parse_mode=%s repair_operations=%s finish_reason=%s "
+                    "transport_complete=%s fallback=stable_truncation category=%s raw_response=%s",
                     invocation.invocation_id,
-                    invocation.metadata.get("estimated_input_tokens", "unknown"),
-                    invocation.metadata.get("output_reserve_tokens", "unknown"),
+                    invocation.metadata.get("attempt", "unknown"),
+                    extraction.parse_mode,
+                    extraction.repair_operations,
                     invocation.finish_reason or "unknown",
-                    extraction.error,
+                    invocation.transport_complete,
+                    extraction.error_category or "unknown",
                     json.dumps(raw, ensure_ascii=False),
                 )
         except Exception as exc:
-            logger.warning(
-                "[skill_doc_opt] select ranking failed, fallback truncation: %s",
+            logged = _log_failed_structured_invocation(
                 exc,
+                stage="ranking",
+                schema_name=RANKING_POLICY.schema_name,
+                fallback="stable_truncation",
+                parse=parse,
             )
+            if not logged:
+                logger.warning(
+                    "[skill_doc_opt] select ranking failed, fallback truncation: %s",
+                    exc,
+                )
 
         # Fallback: simple truncation
         return edits[:budget]

@@ -40,6 +40,10 @@ async def invoke_text_with_retry(
     retry_prompt: str | None = None,
     temperature: float | None = None,
     is_result_usable: Callable[[str], bool] | None = None,
+    result_validator: Callable[[str], bool] | None = None,
+    result_error_classifier: Callable[[str], str | None] | None = None,
+    output_schema_name: str | None = None,
+    context: LLMInvocationContext | None = None,
     **kwargs: Any,
 ) -> str:
     """Return text while retaining budgeting/retry/limiting in ``LLMInvocation``."""
@@ -52,6 +56,10 @@ async def invoke_text_with_retry(
         retry_prompt=retry_prompt,
         temperature=temperature,
         is_result_usable=is_result_usable,
+        result_validator=result_validator,
+        result_error_classifier=result_error_classifier,
+        output_schema_name=output_schema_name,
+        context=context,
         **kwargs,
     )
     return raw
@@ -67,6 +75,10 @@ async def invoke_with_retry(
     retry_prompt: str | None = None,
     temperature: float | None = None,
     is_result_usable: Callable[[str], bool] | None = None,
+    result_validator: Callable[[str], bool] | None = None,
+    result_error_classifier: Callable[[str], str | None] | None = None,
+    output_schema_name: str | None = None,
+    context: LLMInvocationContext | None = None,
     **kwargs: Any,
 ) -> LLMInvocationResult:
     """Return the complete provider-neutral result for diagnostic-aware callers."""
@@ -74,13 +86,18 @@ async def invoke_with_retry(
     if not isinstance(llm, LLMInvocation):
         raise TypeError("optimizer LLM calls require the run-scoped LLMInvocation")
     retry_messages = (UserMessage(content=retry_prompt),) if retry_prompt is not None else None
+    if result_validator is not None and is_result_usable is not None:
+        raise ValueError("pass result_validator or is_result_usable, not both")
+    validator = result_validator or is_result_usable
     return await llm.invoke(
         LLMInvocationRequest(
             stage=stage,
             messages=(UserMessage(content=prompt),),
             retry_messages=retry_messages,
-            result_validator=is_result_usable,
-            context=LLMInvocationContext(run_id="optimizer"),
+            result_validator=validator,
+            result_error_classifier=result_error_classifier,
+            output_schema_name=output_schema_name,
+            context=context or LLMInvocationContext(run_id="optimizer"),
             retry_policy=LLMRetryPolicy(
                 max_attempts=policy.max_attempts,
                 attempt_timeout_secs=policy.attempt_timeout_secs,
@@ -102,6 +119,10 @@ async def invoke_text_with_retry_and_prompt(
     retry_prompt: str | None = None,
     temperature: float | None = None,
     is_result_usable: Callable[[str], bool] | None = None,
+    result_validator: Callable[[str], bool] | None = None,
+    result_error_classifier: Callable[[str], str | None] | None = None,
+    output_schema_name: str | None = None,
+    context: LLMInvocationContext | None = None,
     **kwargs: Any,
 ) -> tuple[str, str]:
     """Invoke through the sole seam and report which prompt produced the result."""
@@ -114,6 +135,10 @@ async def invoke_text_with_retry_and_prompt(
         retry_prompt=retry_prompt,
         temperature=temperature,
         is_result_usable=is_result_usable,
+        result_validator=result_validator,
+        result_error_classifier=result_error_classifier,
+        output_schema_name=output_schema_name,
+        context=context,
         **kwargs,
     )
     used_prompt = retry_prompt if result.metadata.get("attempt", 1) > 1 and retry_prompt else prompt

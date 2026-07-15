@@ -75,17 +75,23 @@ async def test_length_finish_is_not_returned_as_complete_structured_output() -> 
         chars_per_token=1.0,
         default_output_reserve_tokens=10,
     )
+    validator = MagicMock(return_value=True)
+    classifier = MagicMock(return_value="syntax")
     request = LLMInvocationRequest(
         stage="evaluator",
         messages=(UserMessage(content="short"),),
         context=LLMInvocationContext(run_id="run-1"),
         retry_policy=LLMRetryPolicy(1, 1.0, 1.0, 0.0, 0.0),
+        result_validator=validator,
+        result_error_classifier=classifier,
     )
 
     with pytest.raises(LLMInvocationError) as exc_info:
         await invocation.invoke(request)
 
     assert exc_info.value.category == "finish_reason_length"
+    validator.assert_not_called()
+    classifier.assert_not_called()
 
 
 async def test_stage_output_reserve_participates_in_preflight_budget() -> None:
@@ -257,6 +263,39 @@ async def test_sync_and_async_callers_share_one_invocation_loop_and_limiter() ->
     assert max_active == 2
 
 
+def test_invocation_limiter_survives_repeated_asyncio_run_loops() -> None:
+    """训练/回调反复创建 event loop 时不得复用已绑定到旧 loop 的 limiter。"""
+
+    class Provider:
+        async def invoke(self, messages: object, **kwargs: object) -> object:
+            del messages, kwargs
+            await asyncio.sleep(0.01)
+            return type("Response", (), {"content": "ok", "metadata": {}})()
+
+    invocation = LLMInvocation(
+        Provider(),
+        capabilities=LLMProviderCapabilities(100, False, False, False, False, "either"),
+        parallelism=1,
+        safety_margin_tokens=1,
+        chars_per_token=1.0,
+        default_output_reserve_tokens=5,
+    )
+    request = LLMInvocationRequest(
+        stage="evaluator",
+        messages=(UserMessage(content="prompt"),),
+        context=LLMInvocationContext(run_id="run-1"),
+        retry_policy=LLMRetryPolicy(1, 1.0, 2.0, 0.0, 0.0),
+    )
+
+    async def run_accumulation_round() -> list[str]:
+        results = await asyncio.gather(invocation.invoke(request), invocation.invoke(request))
+        return [result.text for result in results]
+
+    for _step in range(3):
+        for _accumulation in range(2):
+            assert asyncio.run(run_accumulation_round()) == ["ok", "ok"]
+
+
 async def test_icbc_stream_integrity_failure_keeps_transport_category() -> None:
     """ICBC 坏流重试耗尽后不能降级为普通 llm_invoke_error。"""
     provider = MagicMock()
@@ -286,3 +325,47 @@ async def test_icbc_stream_integrity_failure_keeps_transport_category() -> None:
         )
 
     assert exc_info.value.category == "transport_incomplete"
+
+
+async def test_invalid_structured_output_retries_with_schema_diagnostics(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """完整但无效的结构化输出共用 invocation retry，并返回成功 attempt。"""
+    invalid = type("Response", (), {"content": '{"goal":', "metadata": {}})()
+    valid = type("Response", (), {"content": '{"goal": "done"}', "metadata": {}})()
+    provider = MagicMock()
+    provider.invoke = AsyncMock(side_effect=[invalid, valid])
+    invocation = LLMInvocation(
+        provider,
+        capabilities=LLMProviderCapabilities(100, False, False, False, False, "either"),
+        parallelism=1,
+        safety_margin_tokens=1,
+        chars_per_token=1.0,
+        default_output_reserve_tokens=5,
+    )
+    classifier_calls: list[str] = []
+
+    def classify(text: str) -> str:
+        classifier_calls.append(text)
+        return "syntax"
+
+    with caplog.at_level("WARNING", logger="evo_agent.llm.invocation"):
+        result = await invocation.invoke(
+            LLMInvocationRequest(
+                stage="goal_generator",
+                messages=(UserMessage(content="full prompt"),),
+                retry_messages=(UserMessage(content="return goal JSON"),),
+                result_validator=lambda text: text == '{"goal": "done"}',
+                result_error_classifier=classify,
+                output_schema_name="goal_generation",
+                context=LLMInvocationContext(run_id="run-1"),
+                retry_policy=LLMRetryPolicy(2, 1.0, 2.0, 0.0, 0.0),
+            )
+        )
+
+    assert result.text == '{"goal": "done"}'
+    assert result.metadata["attempt"] == 2
+    assert provider.invoke.await_count == 2
+    assert classifier_calls == ['{"goal":']
+    assert "schema_name=goal_generation" in caplog.text
+    assert "output_error_category=syntax" in caplog.text

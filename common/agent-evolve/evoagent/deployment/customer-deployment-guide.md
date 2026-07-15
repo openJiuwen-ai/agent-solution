@@ -209,11 +209,15 @@ EVO_LLM_PROVIDER=ICBC
 EVO_ICBC_TOKEN=<JWT,Secret 注入,勿写明文>
 EVO_ICBC_USER_ID=<工行分配的固定 userId>
 EVO_ICBC_ENDPOINT=http://aigc.sdc.cs.icbc/mlpmodelservice/aigc/chat/completions
+EVO_ICBC_CONTEXT_WINDOW_TOKENS=32768
 EVO_ICBC_TIMEOUT=120.0
 
 # ===== Adapter sidecar 地址（API 模式必填）=====
 # 同机：host.docker.internal；跨机：Adapter 机器 IP
 EVO_ADAPTER_URL=http://host.docker.internal:8900
+EVO_MANAGED_DOC_APPLY_DEADLINE=600
+EVO_MANAGED_DOC_CONTENT_POLICIES={"agent_rule":"preserving"}
+EVO_MANAGED_DOC_PROTECTED_SECTIONS={}
 
 # ===== 数据集路径白名单（防路径穿越，逗号分隔）=====
 EVO_ALLOWED_DATA_ROOTS=/data/evo_agent,/tmp/evo_agent
@@ -245,7 +249,7 @@ EVO_ARTIFACT_DIR=./workspace/artifacts
 |---|---|
 | 始终 | `EVO_ADAPTER_URL` |
 | `EVO_LLM_PROVIDER=OpenAI` | `EVO_LLM_API_KEY` / `EVO_LLM_BASE_URL` / `EVO_OPTIMIZER_MODEL` / `EVO_TARGET_MODEL` |
-| `EVO_LLM_PROVIDER=ICBC` | `EVO_ICBC_TOKEN` / `EVO_ICBC_USER_ID` / `EVO_ICBC_ENDPOINT`（其余 LLM_* 被忽略） |
+| `EVO_LLM_PROVIDER=ICBC` | `EVO_ICBC_TOKEN` / `EVO_ICBC_USER_ID` / `EVO_ICBC_ENDPOINT` / `EVO_ICBC_CONTEXT_WINDOW_TOKENS`（其余 LLM_* 被忽略） |
 
 ### 5.3 启动
 
@@ -433,7 +437,7 @@ ls -lh deployment/workspace/artifacts/   # 训练过程产物（skill patches、
 | `422 Dataset path must be under allowed roots` | `dataset_path` 不在 `EVO_ALLOWED_DATA_ROOTS` 下，或宿主/容器路径映射搞反 |
 | `422 Dataset file not found` | 容器内 `/data` ← 宿主 `/home/evolution/data`，文件要放对地方 |
 | 容器一直 `starting` 不转 `healthy` | 等 15s 启动期后 `docker logs evoagent`，多为 `.env` 缺必填或 ICBC 凭证错 |
-| ICBC 模式启动 fail-fast 报必填缺失 | `EVO_LLM_PROVIDER=ICBC` 时 `EVO_ICBC_TOKEN/USER_ID/ENDPOINT` 三项不能空 |
+| ICBC 模式启动 fail-fast 报必填缺失 | `EVO_LLM_PROVIDER=ICBC` 时 `EVO_ICBC_TOKEN/USER_ID/ENDPOINT/CONTEXT_WINDOW_TOKENS` 四项不能空 |
 | `ICBCTokenExpiredError` | JWT 过期，需找客户换 token 后改 `.env` 重启 |
 | `docker build` 拉 wheel 失败 | 换 `PIP_INDEX_URL` 为可用源，或离线包导入 |
 | Adapter 与 EvoAgent 数据集路径不一致 | EvoAgent 把数据集路径传给 Adapter，两边挂载要协调（skill 文件通常由 Adapter 的 `HOST_SKILLS_DIR` 管） |

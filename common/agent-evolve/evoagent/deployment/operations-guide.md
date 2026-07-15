@@ -211,6 +211,7 @@ EVO_DEFAULT_EPOCHS=3          # 默认训练轮数
 EVO_DEFAULT_BATCH_SIZE=4      # 默认 batch
 EVO_SCORE_THRESHOLD=0.5       # 成功/失败分界线
 EVO_PARALLELISM=4             # 并发度
+EVO_MANAGED_DOC_APPLY_DEADLINE=600 # managed-doc 模式须 ≥ Adapter max_task_seconds + 10
 ```
 
 完整变量含义参见项目根目录的 `docs/develop/scenario-optimizer-guide.md` 与 `docs/api/optimization-api-reference.md`。

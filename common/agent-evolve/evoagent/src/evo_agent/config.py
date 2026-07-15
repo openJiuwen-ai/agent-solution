@@ -122,7 +122,7 @@ class EvolveConfig(BaseSettings):
 
     @model_validator(mode="after")
     def _validate_icbc_config(self) -> Self:
-        """ICBC 模式 fail-fast：llm_provider=="ICBC" 时三凭证字段必填。
+        """ICBC 模式 fail-fast：provider 凭证与 context window 必填。
 
         ``llm_provider`` 大小写归一（``icbc`` → ``ICBC``），避免填小写被
         静默走 OpenAI 默认路径。OpenAI 模式不校验 ICBC 字段，保持

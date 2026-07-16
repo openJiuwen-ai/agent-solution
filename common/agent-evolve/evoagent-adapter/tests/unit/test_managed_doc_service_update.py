@@ -215,4 +215,3 @@ async def test_oversize_content_does_not_write_file(tmp_path: Path) -> None:
     assert path.read_text(encoding="utf-8") == RULE_V1
     # 不建 task、不调 apply
     assert strategy.call_count == 0
-

@@ -8,25 +8,17 @@ from fastapi.testclient import TestClient
 from agent_adapter.config import load_config
 
 _LISTING_FIXTURE = (
-    Path(__file__).parents[1]
-    / "fixtures"
-    / "studio_prompt"
-    / "adapter_managed_doc_list.json"
+    Path(__file__).parents[1] / "fixtures" / "studio_prompt" / "adapter_managed_doc_list.json"
 )
 
 
 def _make_app(tmp_path: Path, *, managed_docs_yaml: str):
     yaml_path = tmp_path / "config.yaml"
     docs_block = (
-        f"    managed_docs:\n{managed_docs_yaml}"
-        if managed_docs_yaml
-        else "    managed_docs: []\n"
+        f"    managed_docs:\n{managed_docs_yaml}" if managed_docs_yaml else "    managed_docs: []\n"
     )
     yaml_path.write_text(
-        "agents:\n"
-        "  - name: edp\n"
-        "    agent_url: http://localhost:8090\n"
-        f"{docs_block}",
+        f"agents:\n  - name: edp\n    agent_url: http://localhost:8090\n{docs_block}",
         encoding="utf-8",
     )
     from agent_adapter.api.app import create_app
@@ -81,11 +73,7 @@ def test_listing_excludes_file_only_documents_from_optimization_whitelist(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "Notes.md"
-    docs_yaml = (
-        "      - kind: notes\n"
-        f"        path: {path}\n"
-        "        apply: file_only\n"
-    )
+    docs_yaml = f"      - kind: notes\n        path: {path}\n        apply: file_only\n"
     app = _make_app(tmp_path, managed_docs_yaml=docs_yaml)
 
     response = TestClient(app).get("/api/v1/agents/edp/managed-docs")

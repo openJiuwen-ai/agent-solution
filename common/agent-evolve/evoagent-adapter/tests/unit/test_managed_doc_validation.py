@@ -90,4 +90,3 @@ def test_default_max_256k_passes_normal_doc() -> None:
     """默认上限（262_144）下普通文档通过——保持向后兼容签名。"""
     content = "---\nauthor: x\n---\n# Rule\n\nDo thing.\n"
     validate(content)  # 不传 max_content_bytes → 默认 262_144
-

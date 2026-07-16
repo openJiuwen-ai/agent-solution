@@ -39,9 +39,7 @@ def test_managed_doc_compose_override_grants_docker_socket() -> None:
     )
     volumes = override["services"]["adapter"]["volumes"]
 
-    assert volumes == [
-        "${HOST_DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock"
-    ]
+    assert volumes == ["${HOST_DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock"]
 
 
 def test_runtime_image_contains_docker_cli_package() -> None:

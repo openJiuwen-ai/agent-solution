@@ -47,9 +47,7 @@ def validate(content: str, max_content_bytes: int = 262_144) -> None:
     try:
         encoded = content.encode("utf-8")
     except UnicodeEncodeError as exc:
-        raise InvalidDocContentError(
-            f"content is not UTF-8 encodable: {exc}"
-        ) from exc
+        raise InvalidDocContentError(f"content is not UTF-8 encodable: {exc}") from exc
     if len(encoded) > max_content_bytes:
         raise InvalidDocContentError(
             f"content size {len(encoded)} bytes exceeds max {max_content_bytes}"

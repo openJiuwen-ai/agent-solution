@@ -291,9 +291,7 @@ def test_restart_resolve_defaults_max_content_bytes_256k() -> None:
 
 
 def test_file_only_resolve_passes_explicit_max_content_bytes() -> None:
-    doc = ManagedDocConfig(
-        kind="agent_rule", path="/x", apply="file_only", max_content_bytes=512
-    )
+    doc = ManagedDocConfig(kind="agent_rule", path="/x", apply="file_only", max_content_bytes=512)
     reg = ManagedDocRegistry(agents=[_agent(docs=[doc])], defaults=ManagedDocDefaults())
     got = reg.get("edp", "agent_rule")
     assert got.max_content_bytes == 512

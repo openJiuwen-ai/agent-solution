@@ -196,7 +196,8 @@ class ManagedDocService:
         spawned = False
         try:
             snapshot = storage.read_snapshot()  # DocNotFoundError → 404 if absent
-            validate(snapshot, cfg.max_content_bytes)  # defensive V2 (snapshot was valid when written)
+            # Defensive V2: the snapshot was valid when it was written.
+            validate(snapshot, cfg.max_content_bytes)
             new_sha = DocStorage.sha256(snapshot)
             storage.write_file_atomic(snapshot)
 

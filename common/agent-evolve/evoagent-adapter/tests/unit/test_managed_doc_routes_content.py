@@ -34,7 +34,7 @@ def _edp_yaml(
     path = tmp_path / "host" / "edp" / "AgentRule.md"
     path.parent.mkdir(parents=True, exist_ok=True)
     # 显式行构建（避免 textwrap.dedent 对多行 extra 的缩进错位）。
-    item_fields = [f"kind: agent_rule", f"path: {path}", f"apply: {apply}"]
+    item_fields = ["kind: agent_rule", f"path: {path}", f"apply: {apply}"]
     if restart_cmd:
         item_fields.append(f"restart_cmd: {restart_cmd}")
     if restart_timeout is not None:

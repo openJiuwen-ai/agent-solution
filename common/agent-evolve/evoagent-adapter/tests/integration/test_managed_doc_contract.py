@@ -371,8 +371,7 @@ async def _confirm_target_from_snapshot(
         if body["pending_apply"]:
             continue
         return (
-            body["file_revision"] == target_revision
-            and body["applied_revision"] == target_revision
+            body["file_revision"] == target_revision and body["applied_revision"] == target_revision
         )
     return False
 

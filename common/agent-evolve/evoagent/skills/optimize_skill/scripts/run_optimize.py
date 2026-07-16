@@ -45,7 +45,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--scenario",
         default="edp_agent",
-        help="场景名称（对应 scenarios/<name>/scenario.yaml）",
+        help="场景名称（对应 examples/scenarios/<name>/scenario.yaml）",
     )
     parser.add_argument(
         "--dataset-manifest",

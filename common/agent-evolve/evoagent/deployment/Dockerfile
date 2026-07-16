@@ -42,7 +42,7 @@ RUN pip install --no-cache-dir vendor/openjiuwen-*.whl && \
 
 # 复制源码
 COPY src/ ./src/
-COPY scenarios/ ./scenarios/
+COPY examples/scenarios/ ./examples/scenarios/
 COPY skills/ ./skills/
 
 EXPOSE 8000

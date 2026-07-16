@@ -25,7 +25,7 @@ data/skills/
 宿主机路径（示例）：
 
 ```text
-agent-store/community/EDPAgent/skills/  →  data/skills/edp_agent/
+业务 Agent 的 skills 目录  →  data/skills/edp_agent/
 ```
 
 Docker：

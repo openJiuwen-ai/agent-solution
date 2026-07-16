@@ -1,7 +1,7 @@
 # EvoAgent 客户现场部署教程（双容器）
 
 > 适用：客户 Linux 环境，EvoAgent + EvoAgentAdapter **双容器**联合部署。
-> 仓内姊妹文档：`deployment/README.md`（EvoAgent 单容器细节）、`community/EvoAgentAdapter/deployment/`（Adapter 细节）。
+> 仓内姊妹文档：`deployment/README.md`（EvoAgent 单容器细节）、`common/agent-evolve/evoagent-adapter/deployment/`（Adapter 细节）。
 
 ---
 
@@ -126,12 +126,12 @@ docker network create evo-net
 
 ## 4. Adapter 部署
 
-> 目录：`community/EvoAgentAdapter/deployment/`
+> 目录：`common/agent-evolve/evoagent-adapter/deployment/`
 
 ### 4.1 配置
 
 ```bash
-cd community/EvoAgentAdapter/deployment
+cd common/agent-evolve/evoagent-adapter/deployment
 cp config/.env.example config/.env
 vim config/.env
 ```
@@ -164,17 +164,17 @@ docker ps --filter "name=adapter"          # 期望 (healthy)
 
 ## 5. EvoAgent 部署
 
-> 目录：`community/EvoAgent/deployment/`
+> 目录：`common/agent-evolve/evoagent/deployment/`
 
 ### 5.1 构建镜像（联网机器）
 
 ```bash
-cd community/EvoAgent/deployment
+cd common/agent-evolve/evoagent/deployment
 
 # 推荐：PyPI 拉 openjiuwen wheel
 HOME=/home/evolution/build \
-EVOAGENT_STORE_REPO=https://gitcode.com/AE-TEAM/agent-store.git \
-EVOAGENT_STORE_BRANCH=dev_enterprise_evolution \
+EVOAGENT_SOLUTION_REPO=https://gitcode.com/AE-TEAM/agent-solution.git \
+EVOAGENT_SOLUTION_BRANCH=common \
 EVOAGENT_IMAGE_TAG=evoagent:latest \
 ./build.sh --local
 ```
@@ -363,13 +363,13 @@ curl -X POST http://localhost:8000/optimize/job_xxx/cancel
 
 ```bash
 # EvoAgent
-cd community/EvoAgent/deployment
+cd common/agent-evolve/evoagent/deployment
 ./build.sh --local
 ./export-bundle.sh evoagent:latest
 # → ../evoagent-offline-YYYYMMDD.tar.gz
 
 # Adapter
-cd community/EvoAgentAdapter/deployment
+cd common/agent-evolve/evoagent-adapter/deployment
 ./export-bundle.sh agent-adapter:latest
 # → ../agent-adapter-offline-YYYYMMDD.tar.gz
 ```
@@ -450,8 +450,8 @@ ls -lh deployment/workspace/artifacts/   # 训练过程产物（skill patches、
 
 ```bash
 # 启动
-cd community/EvoAgentAdapter/deployment && ./start.sh
-cd community/EvoAgent/deployment && ./run.sh
+cd common/agent-evolve/evoagent-adapter/deployment && ./start.sh
+cd common/agent-evolve/evoagent/deployment && ./run.sh
 
 # 验证
 curl http://localhost:8900/api/v1/status
@@ -468,8 +468,8 @@ docker logs -f evoagent
 docker logs -f adapter
 
 # 停
-cd community/EvoAgent/deployment && ./stop.sh
-cd community/EvoAgentAdapter/deployment && ./stop.sh
+cd common/agent-evolve/evoagent/deployment && ./stop.sh
+cd common/agent-evolve/evoagent-adapter/deployment && ./stop.sh
 ```
 
 ---

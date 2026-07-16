@@ -99,6 +99,7 @@ agents:
     #   - kind: agent_rule                       # doc 种类（端点 doc_kind）
     #     path: /data/agents/edp_agent/AgentRule.md   # 宿主侧挂载路径（绝对）
     #     allow_root: /data/agents/edp_agent     # 可选但建议：path 必须位于其下的挂载根（路径穿越防护）
+    #     max_content_bytes: 262144               # UTF-8 内容上限；超限请求返回 400
     #     apply: restart                         # file_only（仅写文件）| restart（写文件+重启生效）
     #     restart_cmd: "docker restart edp_agent"    # apply=restart 必填；容器名须为真实业务 Agent 容器名
     #     health_url: "http://host.docker.internal:8090/health"

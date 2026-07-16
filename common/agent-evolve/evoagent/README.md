@@ -54,7 +54,20 @@ uv run uvicorn evo_agent.api.app:app --host 0.0.0.0 --port 8001
 | `POST` | `/optimize/{job_id}/cancel` | 取消运行中的任务 |
 | `POST` | `/evaluate` | 同步评估单条轨迹（不走优化管线） |
 | `GET` | `/scenarios` | 列出已注册场景 |
+| `GET` | `/capabilities` | 列出服务能力与 managed-doc 支持情况 |
 | `GET` | `/health` | 健康检查 |
+
+Managed-doc 优化相关环境变量：
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `EVO_VALIDATION_MAX_CASE_ATTEMPTS` | `2` | 单个验证 case 最大尝试次数 |
+| `EVO_VALIDATION_MIN_SUCCESS_RATIO` | `1.0` | 验证批次最低成功比例 |
+| `EVO_VALIDATION_REQUIRE_SAME_CASE_SET` | `true` | 候选与基线必须使用同一 case 集合 |
+| `EVO_MANAGED_DOC_APPLY_DEADLINE` | `600` | managed-doc apply 总时限（秒） |
+| `EVO_MANAGED_DOC_CANCEL_ROLLBACK_DEADLINE` | `900` | 取消后完成或回滚的总时限（秒） |
+| `EVO_MANAGED_DOC_CONTENT_POLICIES` | `{}` | 按 doc kind 配置 `preserving` 或 `passthrough` |
+| `EVO_MANAGED_DOC_PROTECTED_SECTIONS` | `{}` | 按 doc kind 配置必须原样保留的 marker 区段 |
 
 ## 项目结构
 
@@ -87,8 +100,7 @@ common/agent-evolve/evoagent/
 │   ├── scenario/              # 场景适配层（ScenarioRegistry + prompts 两级查找）
 │   └── reporter/              # 报告生成（artifact → OptimizeReport，train/val 分组）
 ├── tests/                     # 测试（unit / integration / e2e）
-├── docs/rules/                # AI 编码规范（唯一内容源）
-└── examples/                  # 示例
+└── examples/                  # 示例与场景定义
 ```
 
 ## 场景开发
@@ -135,7 +147,8 @@ curl -X POST http://localhost:8001/optimize \
   }'
 ```
 
-API 模式使用嵌套模板结构（`OptimizeAPIRequest`），支持平台配置管理。详见 `docs/adr/0005-platform-template-driven-api.md`。
+API 模式使用嵌套模板结构（`OptimizeAPIRequest`），支持平台配置管理。详见
+[`docs/api/optimization-api-reference.md`](docs/api/optimization-api-reference.md)。
 
 ## 开发
 
@@ -166,11 +179,11 @@ EvoAgent 是 SkillOpt 合入方案的使用层：
 
 ## 性能与可观测性
 
-- **并发控制**: ReflACT 管线的 reflect / aggregate / select / slow_update 跨 operator 并行，训练阶段评估 `batch_evaluate` 并发化，全部由单一 `semaphore`（`parallelism`）封顶，见 `optimizer/concurrency.py` 与 ADR-0006。
+- **并发控制**: ReflACT 管线的 reflect / aggregate / select / slow_update 跨 operator 并行，训练阶段评估 `batch_evaluate` 并发化，全部由单一 `semaphore`（`parallelism`）封顶，见 `optimizer/concurrency.py`。
 - **SSE 可观测**: optimizer 各阶段通过 `phase_callback` 推送 `log` 事件（rollout / attribute / reflect / aggregate / select / apply / validation），经 `GET /optimize/{job_id}/stream` 实时下发，事件类型见 `api/events.py`。
 - **报告结构**: `OptimizeReport` 按 `train` / `val` 分组（Wave 10 起），per-skill 明细落在 `skill_scores`。
 
-详见 [架构文档](docs/rules/architecture.md)、[ADR 文档](docs/adr/) 与 [性能优化 ADR-0006](docs/adr/0006-skill-pipeline-performance-optimization.md)。
+接口与部署细节见 [`docs/api/`](docs/api/) 和 [`deployment/`](deployment/)。
 
 ## License
 

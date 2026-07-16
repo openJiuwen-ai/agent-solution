@@ -35,7 +35,7 @@ deployment/
 | Adapter Sidecar | 已独立部署，EvoAgent 通过 `EVO_ADAPTER_URL` 访问 |
 | LLM API | OpenAI 兼容接口 |
 
-> Adapter Sidecar 部署见同仓库 `community/EvoAgentAdapter`。EvoAgent 与 Adapter 必须**同时可用**。
+> Adapter Sidecar 部署见同仓库 `common/agent-evolve/evoagent-adapter`。EvoAgent 与 Adapter 必须**同时可用**。
 
 ---
 
@@ -46,7 +46,7 @@ deployment/
 cd deployment
 
 # 2. 构建镜像（--local 从 PyPI 下载 openjiuwen agent-core wheel，最简模式）
-HOME=/home/evolution/build EVOAGENT_STORE_REPO=https://gitcode.com/AE-TEAM/agent-store.git EVOAGENT_STORE_BRANCH=dev_enterprise_evolution EVOAGENT_IMAGE_TAG=evoagent:latest ./build.sh --local 
+HOME=/home/evolution/build EVOAGENT_SOLUTION_REPO=https://gitcode.com/AE-TEAM/agent-solution.git EVOAGENT_SOLUTION_BRANCH=common EVOAGENT_IMAGE_TAG=evoagent:latest ./build.sh --local
 
 # 3. 配置环境变量
 cp config/.env.example config/.env
@@ -68,13 +68,13 @@ curl http://localhost:8000/openapi.json
 ### 方式 A：手动 clone（推荐首次了解项目）
 
 ```bash
-git clone --branch {{EVOAGENT_STORE_BRANCH}} {{EVOAGENT_STORE_REPO}} ~/EvoAgent/agent-store
-cd ~/EvoAgent/agent-store/community/EvoAgent/deployment
+git clone --branch {{EVOAGENT_SOLUTION_BRANCH}} {{EVOAGENT_SOLUTION_REPO}} ~/EvoAgent/agent-solution
+cd ~/EvoAgent/agent-solution/common/agent-evolve/evoagent/deployment
 ```
 
 ### 方式 B：由 build.sh 自动 clone
 
-`build.sh` 默认会 clone 到 `$HOME/EvoAgent/agent-store`，无需手动操作（见第 2 节）。
+`build.sh` 默认会 clone 到 `$HOME/EvoAgent/agent-solution`，无需手动操作（见第 2 节）。
 
 ---
 
@@ -96,8 +96,8 @@ cd ~/EvoAgent/agent-store/community/EvoAgent/deployment
 # 最简模式
 ./build.sh --local
 
-# 指定 agent-store 仓库地址 + 仓库分支 + 自定义镜像 tag
-HOME=/home/evolution/build EVOAGENT_STORE_REPO=https://gitcode.com/AE-TEAM/agent-store.git EVOAGENT_STORE_BRANCH=dev_enterprise_evolution EVOAGENT_IMAGE_TAG=evoagent:v0.0.5 ./build.sh --local 
+# 指定 agent-solution 仓库地址 + 仓库分支 + 自定义镜像 tag
+HOME=/home/evolution/build EVOAGENT_SOLUTION_REPO=https://gitcode.com/AE-TEAM/agent-solution.git EVOAGENT_SOLUTION_BRANCH=common EVOAGENT_IMAGE_TAG=evoagent:v0.0.5 ./build.sh --local
 
 # 已 clone 代码，仅构建镜像
 ./build.sh --skip-pull --local
@@ -108,8 +108,10 @@ HOME=/home/evolution/build EVOAGENT_STORE_REPO=https://gitcode.com/AE-TEAM/agent
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `EVOAGENT_IMAGE_TAG` | `evoagent:latest` | 构建出的镜像 tag |
-| `EVOAGENT_STORE_REPO` | `https://gitcode.com/openJiuwen/agent-store.git` | agent-store 仓库地址 |
-| `EVOAGENT_STORE_BRANCH` | `main` | 仓库分支 |
+| `EVOAGENT_SOLUTION_REPO` | `https://gitcode.com/openJiuwen/agent-solution.git` | agent-solution 仓库地址 |
+| `EVOAGENT_SOLUTION_BRANCH` | `common` | 仓库分支 |
+| `EVOAGENT_CORE_REPO` | `https://gitcode.com/openJiuwen/agent-core.git` | 源码构建模式使用的 agent-core 仓库 |
+| `EVOAGENT_CORE_BRANCH` | `main` | agent-core 分支（独立于 solution 分支） |
 | `EVOAGENT_CORE_VERSION` | `0.1.13` | `--local` 模式下 PyPI 版本号 |
 | `EVOAGENT_SKIP_PULL` | `0` | `1` 跳过代码拉取 |
 | `PIP_INDEX_URL` | 华为云镜像 | pip 源（内网可替换为私有源） |
@@ -156,7 +158,7 @@ EVO_ICBC_CONTEXT_WINDOW_TOKENS=32768 # 必填，按现场模型规格填写
 EVO_ICBC_TIMEOUT=120.0               # 可选，流式 read 超时（秒），默认 120
 ```
 
-设为 `ICBC` 后，`EVO_LLM_API_KEY` / `EVO_LLM_BASE_URL` 被忽略；token、userId、endpoint、context window 四项必填（启动时 fail-fast 校验）。协议细节见 `docs/adr/0008-icbc-endpoint-openai-streaming.md`。
+设为 `ICBC` 后，`EVO_LLM_API_KEY` / `EVO_LLM_BASE_URL` 被忽略；token、userId、endpoint、context window 四项必填（启动时 fail-fast 校验）。
 
 ### 3.3 数据路径白名单（重要）
 
@@ -366,11 +368,9 @@ curl http://localhost:8000/openapi.json            # 验证
 |------|------|
 | 详细操作指南 | [operations-guide.md](./operations-guide.md) |
 | 项目 README | [../README.md](../README.md) |
-| 架构规则 | [../docs/rules/architecture.md](../docs/rules/architecture.md) |
 | API 参考 | [../docs/api/optimization-api-reference.md](../docs/api/optimization-api-reference.md) |
-| 场景开发指南 | [../docs/develop/scenario-optimizer-guide.md](../docs/develop/scenario-optimizer-guide.md) |
 | 配置源码 | [../src/evo_agent/config.py](../src/evo_agent/config.py) |
-| Adapter 部署 | `community/EvoAgentAdapter/`（同仓库兄弟目录） |
+| Adapter 部署 | `common/agent-evolve/evoagent-adapter/`（同仓库兄弟目录） |
 
 ---
 

@@ -6,7 +6,6 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from evo_agent.api.jobs import job_manager
-from evo_agent.config import EvolveConfig
 
 router = APIRouter(tags=["capabilities"])
 
@@ -30,17 +29,15 @@ async def get_capabilities() -> CapabilitiesResponse:
                 "message": "optimization control store is unavailable",
             },
         )
-    config = EvolveConfig.get()
-    adapter_operation_idempotency = bool(
-        config.adapter_url and config.managed_doc_operation_idempotency
-    )
     return CapabilitiesResponse(
-        managed_doc_optimization=adapter_operation_idempotency,
-        managed_doc_epoch_contents=adapter_operation_idempotency,
-        managed_doc_cooperative_cancellation=adapter_operation_idempotency,
-        managed_doc_baseline_rollback=adapter_operation_idempotency,
-        optimization_submit_idempotency=adapter_operation_idempotency,
-        managed_doc_operation_idempotency=adapter_operation_idempotency,
+        managed_doc_optimization=True,
+        managed_doc_epoch_contents=True,
+        managed_doc_cooperative_cancellation=True,
+        managed_doc_baseline_rollback=True,
+        optimization_submit_idempotency=True,
+        # Reserved compatibility field. Adapter durable operation receipts are
+        # deliberately outside the current reviewed scope.
+        managed_doc_operation_idempotency=False,
     )
 
 

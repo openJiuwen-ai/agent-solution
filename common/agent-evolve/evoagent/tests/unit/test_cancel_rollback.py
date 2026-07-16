@@ -28,19 +28,15 @@ def test_rollback_restores_and_confirms_job_start_baseline() -> None:
     revision = hashlib.sha256(baseline.encode()).hexdigest()
 
     class Adapter:
-        operation_id: str | None = None
-
         def start_managed_doc_update_sync(
             self,
             kind: str,
             content: str,
             *,
             request_timeout: float | None = None,
-            operation_id: str | None = None,
         ) -> UpdateStarted:
             assert kind == "agent_rule"
             assert content == baseline
-            self.operation_id = operation_id
             return UpdateStarted(task_id="rollback-task")
 
         def get_managed_doc_task_sync(
@@ -78,13 +74,11 @@ def test_rollback_restores_and_confirms_job_start_baseline() -> None:
         doc_kind="agent_rule",
         baseline_content=baseline,
         baseline_revision=revision,
-        operation_id="evo-cancel:job-1",
         deadline=120.0,
         phase_callback=lambda _event, data: phases.append(data["phase"]),
     )
 
     assert result.task_id == "rollback-task"
-    assert adapter.operation_id == "evo-cancel:job-1"
     assert phases == ["rollback_started", "rollback_completed"]
 
 
@@ -125,7 +119,6 @@ def test_rollback_revision_mismatch_fails_with_stable_code() -> None:
             doc_kind="agent_rule",
             baseline_content=baseline,
             baseline_revision=revision,
-            operation_id="evo-cancel:job-1",
             deadline=120.0,
         )
 
@@ -162,7 +155,6 @@ def test_rollback_snapshot_transport_failure_is_mapped_to_safe_stable_code() -> 
             doc_kind="agent_rule",
             baseline_content=baseline,
             baseline_revision=revision,
-            operation_id="evo-cancel:job-1",
             deadline=120.0,
         )
 
@@ -189,7 +181,6 @@ def test_rollback_timeout_diagnostics_do_not_leak_adapter_error() -> None:
             doc_kind="agent_rule",
             baseline_content="# baseline",
             baseline_revision="rev-1",
-            operation_id="evo-cancel:job-1",
             deadline=120.0,
         )
 
@@ -215,7 +206,6 @@ def test_rollback_final_confirmation_respects_total_deadline() -> None:
             doc_kind="agent_rule",
             baseline_content="# baseline",
             baseline_revision="rev-1",
-            operation_id="evo-cancel:job-1",
             deadline=30.0,
             clock=lambda: now[0],
         )
@@ -273,7 +263,6 @@ async def test_cancelled_inflight_failure_still_rolls_back_with_remaining_budget
         await run_optimization_with_cancellation_recovery(
             request,
             config,
-            operation_id="evo-cancel:job-1",
             cancellation_token=token,
         )
 
@@ -320,7 +309,6 @@ async def test_cancellation_requested_as_runner_returns_still_triggers_recovery(
         await run_optimization_with_cancellation_recovery(
             request,
             EvolveConfig(),
-            operation_id="evo-cancel:job-1",
             cancellation_token=token,
         )
 
@@ -336,7 +324,6 @@ async def test_cancellation_wrapper_returns_successful_report_unchanged() -> Non
         result = await run_optimization_with_cancellation_recovery(
             OptimizeRequest(scenario="edp_agent", agent_name="agent-a", skills=["skill-a"]),
             EvolveConfig(),
-            operation_id="evo-cancel:job-1",
         )
 
     assert result is report
@@ -378,7 +365,6 @@ async def test_early_prompt_cancel_confirms_expected_revision_before_success() -
         await run_optimization_with_cancellation_recovery(
             request,
             EvolveConfig(),
-            operation_id="evo-cancel:job-1",
             cancellation_token=token,
         )
 
@@ -430,7 +416,6 @@ async def test_total_cancellation_deadline_exhaustion_skips_new_rollback_apply()
         await run_optimization_with_cancellation_recovery(
             request,
             config,
-            operation_id="evo-cancel:job-1",
             cancellation_token=token,
             phase_callback=lambda _event, data: phases.append(data["phase"]),
         )

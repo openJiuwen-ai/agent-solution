@@ -214,7 +214,6 @@ EVO_PARALLELISM=4             # 并发度
 EVO_MANAGED_DOC_APPLY_DEADLINE=600 # managed-doc 模式须 ≥ Adapter max_task_seconds + 10
 EVO_MANAGED_DOC_CANCEL_ROLLBACK_DEADLINE=900 # 必须大于 apply deadline
 EVOAGENT_CONTROL_DB_PATH=./workspace/evoagent-control.db # 必须位于持久卷
-EVO_MANAGED_DOC_OPERATION_IDEMPOTENCY=false # Adapter durable receipt 就绪后才开启
 ```
 
 完整变量含义参见项目根目录的 `docs/develop/scenario-optimizer-guide.md` 与 `docs/api/optimization-api-reference.md`。

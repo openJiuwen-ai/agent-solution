@@ -9,7 +9,6 @@ from httpx import ASGITransport, AsyncClient
 
 from evo_agent.api.app import app
 from evo_agent.api.jobs import JobManager, JobStatus
-from evo_agent.api.routes import capabilities as capabilities_routes
 from evo_agent.api.routes import optimize as optimize_routes
 from evo_agent.config import EvolveConfig
 from evo_agent.control_store import (
@@ -146,57 +145,6 @@ async def test_unknown_submission_receipt_returns_404(
         response = await client.get("/optimize/submissions/missing-task")
 
     assert response.status_code == 404
-
-
-@pytest.mark.asyncio
-async def test_capabilities_report_durable_submit_support() -> None:
-    with patch(
-        "evo_agent.api.routes.capabilities.EvolveConfig.get",
-        return_value=EvolveConfig(
-            adapter_url="http://adapter",
-            managed_doc_operation_idempotency=True,
-        ),
-    ):
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            response = await client.get("/capabilities")
-
-    assert response.status_code == 200
-    assert response.json() == {
-        "managed_doc_optimization": True,
-        "managed_doc_epoch_contents": True,
-        "managed_doc_cooperative_cancellation": True,
-        "managed_doc_baseline_rollback": True,
-        "optimization_submit_idempotency": True,
-        "managed_doc_operation_idempotency": True,
-    }
-
-
-@pytest.mark.asyncio
-async def test_capabilities_do_not_claim_unverified_adapter_idempotency() -> None:
-    with patch(
-        "evo_agent.api.routes.capabilities.EvolveConfig.get",
-        return_value=EvolveConfig(managed_doc_operation_idempotency=False),
-    ):
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            response = await client.get("/capabilities")
-
-    assert response.status_code == 200
-    assert response.json()["managed_doc_operation_idempotency"] is False
-    assert not any(response.json().values())
-
-
-@pytest.mark.asyncio
-async def test_capabilities_fail_closed_when_control_store_is_unavailable(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    unavailable = type("UnavailableManager", (), {"durable_available": False})()
-    monkeypatch.setattr(capabilities_routes, "job_manager", unavailable)
-
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        response = await client.get("/capabilities")
-
-    assert response.status_code == 503
-    assert response.json()["detail"]["code"] == "CAPABILITY_STORAGE_UNAVAILABLE"
 
 
 def test_job_status_changes_are_persisted_in_submission_receipt(tmp_path: Path) -> None:

@@ -18,7 +18,6 @@ import httpx
 from evo_agent.adapter_client.client import AdapterClient, AdapterError
 from evo_agent.adapter_client.types import (
     AlreadyApplied,
-    ManagedDocOperationReceipt,
     ManagedDocSnapshot,
     TaskState,
 )
@@ -78,7 +77,6 @@ class ManagedDocApplier:
         deadline: float = 600.0,
         clock: Callable[[], float] = time.monotonic,
         sleeper: Callable[[float], None] = time.sleep,
-        operation_id: str | None = None,
         cancellation_token: CancellationToken | None = None,
         phase_callback: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> None:
@@ -89,7 +87,6 @@ class ManagedDocApplier:
         self._deadline = deadline
         self._clock = clock
         self._sleeper = sleeper
-        self._operation_id = operation_id
         self._cancellation_token = cancellation_token
         self._phase_callback = phase_callback
         self._cancel_waiting_emitted = False
@@ -206,31 +203,17 @@ class ManagedDocApplier:
         post_start = self._clock()
         post_timeout = self._remaining(start)
         try:
-            post_kwargs: dict[str, Any] = {"request_timeout": post_timeout}
-            if self._operation_id is not None:
-                post_kwargs["operation_id"] = self._operation_id
             post_result = self._client.start_managed_doc_update_sync(
-                self._doc_kind, content, **post_kwargs
+                self._doc_kind, content, request_timeout=post_timeout
             )
         except httpx.TransportError as e:
             post_time = self._clock() - post_start
-            if self._operation_id is not None:
-                return self._recover_operation_after_response_loss(
-                    content_hash=content_hash,
-                    start=start,
-                    post_time=post_time,
-                )
-            total = self._clock() - start
-            raise self._fail(
-                phase="failed_post",
+            return self._recover_snapshot_after_response_loss(
                 content_hash=content_hash,
-                task_id=None,
-                status=None,
-                adapter_error=f"transport error: {e}",
+                start=start,
                 post_time=post_time,
-                poll_time=0.0,
-                total_time=total,
-            ) from e
+                post_error=e,
+            )
         except AdapterError as e:
             post_time = self._clock() - post_start
             total = self._clock() - start
@@ -262,67 +245,78 @@ class ManagedDocApplier:
             post_time=post_time,
         )
 
-    def _recover_operation_after_response_loss(
+    def _recover_snapshot_after_response_loss(
         self,
         *,
         content_hash: str,
         start: float,
         post_time: float,
+        post_error: httpx.TransportError,
     ) -> AppliedDocument:
-        """Consult the durable receipt; never retry an uncertain update POST."""
-        assert self._operation_id is not None
-        try:
-            receipt: ManagedDocOperationReceipt = self._client.get_managed_doc_operation_sync(
-                self._operation_id,
-                request_timeout=self._remaining(start),
-            )
-        except (httpx.TransportError, AdapterError) as exc:
-            raise self._fail(
-                phase="failed_operation_receipt",
-                content_hash=content_hash,
-                task_id=None,
-                status=None,
-                adapter_error=f"operation receipt unavailable: {exc}",
-                post_time=post_time,
-                poll_time=0.0,
-                total_time=self._clock() - start,
-            ) from exc
-        if receipt.target_revision not in (None, content_hash):
-            raise self._fail(
-                phase="failed_operation_receipt",
-                content_hash=content_hash,
-                task_id=receipt.task_id,
-                status=receipt.status,
-                adapter_error="operation target revision does not match request",
-                post_time=post_time,
-                poll_time=0.0,
-                total_time=self._clock() - start,
-            )
-        if receipt.status in ("RECEIVED", "RUNNING") and receipt.task_id is not None:
-            return self._poll_until_terminal(
-                content_hash=content_hash,
-                task_id=receipt.task_id,
-                start=start,
-                post_time=post_time,
-            )
-        if receipt.status == "SUCCEEDED":
-            return self._handle_task_not_found(
-                content_hash=content_hash,
-                task_id=receipt.task_id or "",
-                start=start,
-                post_time=post_time,
-                poll_time=0.0,
-            )
-        raise self._fail(
-            phase="failed_operation_receipt",
-            content_hash=content_hash,
-            task_id=receipt.task_id,
-            status=receipt.status,
-            adapter_error=f"operation receipt terminal/ambiguous: {receipt.status}",
-            post_time=post_time,
-            poll_time=0.0,
-            total_time=self._clock() - start,
-        )
+        """Confirm an uncertain single POST by snapshot only; never resend it."""
+        poll_time = 0.0
+        while True:
+            remaining = self._remaining(start)
+            if remaining <= 0:
+                raise self._fail(
+                    phase="deadline",
+                    content_hash=content_hash,
+                    task_id=None,
+                    status=None,
+                    adapter_error="deadline exceeded confirming uncertain update",
+                    post_time=post_time,
+                    poll_time=poll_time,
+                    total_time=self._clock() - start,
+                ) from post_error
+            read_start = self._clock()
+            try:
+                snapshot = self._client.get_managed_doc_sync(
+                    self._doc_kind, request_timeout=remaining
+                )
+            except (httpx.TransportError, AdapterError):
+                poll_time += self._clock() - read_start
+                if not self._sleep_within_budget(start):
+                    continue
+                continue
+            poll_time += self._clock() - read_start
+            if self._snapshot_confirmed(snapshot, content_hash):
+                self._last_success_hash = content_hash
+                total = self._clock() - start
+                self._record(
+                    phase="recovered",
+                    content_hash=content_hash,
+                    task_id=None,
+                    status=None,
+                    noop=False,
+                    recovered=True,
+                    error=None,
+                    adapter_error=None,
+                    post_time=post_time,
+                    poll_time=poll_time,
+                    total_time=total,
+                )
+                return AppliedDocument(
+                    content_hash=content_hash,
+                    task_id=None,
+                    noop=False,
+                    final_status=None,
+                    recovered=True,
+                    post_time=post_time,
+                    poll_time=poll_time,
+                    total_time=total,
+                )
+            if not snapshot.pending_apply:
+                raise self._fail(
+                    phase="failed_snapshot",
+                    content_hash=content_hash,
+                    task_id=None,
+                    status=None,
+                    adapter_error="uncertain update not confirmed by stable snapshot",
+                    post_time=post_time,
+                    poll_time=poll_time,
+                    total_time=self._clock() - start,
+                ) from post_error
+            self._sleep_within_budget(start)
 
     def _handle_already_applied(
         self,

@@ -368,7 +368,6 @@ async def start_optimize(api_request: OptimizeAPIRequest) -> JobResponse:
             report = await run_optimization_with_cancellation_recovery(
                 internal_request,
                 config,
-                operation_id=f"evo-cancel:{job.job_id}",
                 progress_callback=progress_callback,
                 phase_callback=_phase_callback,
                 cancellation_token=job.cancellation_token,

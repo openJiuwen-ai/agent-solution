@@ -66,14 +66,3 @@ class TaskState:
     down_seen: bool | None
     created_at: str | None
     updated_at: str | None
-
-
-@dataclass(frozen=True)
-class ManagedDocOperationReceipt:
-    """Durable Adapter update receipt used after response loss."""
-
-    operation_id: str
-    status: Literal["RECEIVED", "RUNNING", "SUCCEEDED", "FAILED", "LOST"]
-    task_id: str | None
-    target_revision: str | None
-    last_error: str | None

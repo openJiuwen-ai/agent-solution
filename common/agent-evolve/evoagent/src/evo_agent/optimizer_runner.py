@@ -260,7 +260,6 @@ def rollback_managed_doc(
     doc_kind: str,
     baseline_content: str,
     baseline_revision: str,
-    operation_id: str,
     deadline: float,
     phase_callback: Any | None = None,
     clock: Callable[[], float] = time.monotonic,
@@ -280,7 +279,6 @@ def rollback_managed_doc(
         adapter_client=adapter_client,
         doc_kind=doc_kind,
         deadline=deadline,
-        operation_id=operation_id,
     )
     try:
         result = applier.apply_and_wait(baseline_content)
@@ -837,7 +835,6 @@ async def run_optimization_with_cancellation_recovery(
     request: OptimizeRequest,
     config: EvolveConfig,
     *,
-    operation_id: str,
     progress_callback: Any | None = None,
     phase_callback: Any | None = None,
     cancellation_token: CancellationToken | None = None,
@@ -928,7 +925,6 @@ async def run_optimization_with_cancellation_recovery(
                             doc_kind=request.managed_doc_kind,
                             baseline_content=verified_baseline.content,
                             baseline_revision=baseline_revision,
-                            operation_id=operation_id,
                             deadline=remaining,
                             phase_callback=phase_callback,
                         )

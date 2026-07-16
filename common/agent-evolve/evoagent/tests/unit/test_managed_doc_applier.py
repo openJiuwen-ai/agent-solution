@@ -21,7 +21,6 @@ from evo_agent.adapter_client.applier import (
 from evo_agent.adapter_client.client import AdapterError
 from evo_agent.adapter_client.types import (
     AlreadyApplied,
-    ManagedDocOperationReceipt,
     ManagedDocSnapshot,
     TaskState,
     UpdateStarted,
@@ -133,63 +132,28 @@ def test_applier_succeeded_updates_hash_and_returns_task_id() -> None:
     assert applier.last_success_hash == h
 
 
-def test_operation_receipt_recovers_original_task_after_post_response_loss() -> None:
+def test_snapshot_recovers_apply_after_post_response_loss_without_receipt() -> None:
     content = "# baseline restore"
     revision = _hash(content)
-
-    class ReceiptClient(FakeAdapterClient):
-        operation_calls = 0
-
-        def start_managed_doc_update_sync(
-            self,
-            kind: str,
-            content: str,
-            *,
-            request_timeout: float | None = None,
-            operation_id: str | None = None,
-        ) -> Any:
-            self.post_calls += 1
-            raise httpx.ReadError("response lost")
-
-        def get_managed_doc_operation_sync(
-            self, operation_id: str, *, request_timeout: float | None = None
-        ) -> ManagedDocOperationReceipt:
-            self.operation_calls += 1
-            return ManagedDocOperationReceipt(
-                operation_id=operation_id,
-                status="RUNNING",
-                task_id="original-task",
-                target_revision=revision,
-                last_error=None,
-            )
-
-    client = ReceiptClient(
-        task_responses=[
-            TaskState(
-                status="SUCCEEDED",
-                task_id="original-task",
-                revision=revision,
-                pending_apply=False,
-                last_error=None,
-                attempts=1,
-                down_seen=True,
-                created_at=None,
-                updated_at=None,
-            )
-        ]
+    client = FakeAdapterClient(
+        post_responses=[httpx.ReadError("response lost")],
+        snapshot_responses=[
+            _snap("old", pending_apply=True),
+            _snap(revision),
+        ],
     )
     applier = ManagedDocApplier(
         adapter_client=client,  # type: ignore[arg-type]
         doc_kind="agent_rule",
-        operation_id="evo-cancel:job-1",
         sleeper=lambda _: None,
     )
 
     result = applier.apply_and_wait(content)
 
-    assert result.task_id == "original-task"
+    assert result.recovered is True
+    assert result.task_id is None
     assert client.post_calls == 1
-    assert client.operation_calls == 1
+    assert client.snapshot_calls == 2
 
 
 def test_cancellation_during_apply_emits_waiting_but_polls_to_terminal() -> None:
@@ -316,13 +280,54 @@ def test_applier_deadline_caps_each_request_timeout_and_sleep() -> None:
 
 
 def test_applier_post_not_retried_on_response_loss() -> None:
-    """POST transport 错误 → ManagedDocApplyError，POST 只调一次（不自动重试）。"""
+    """POST transport 错误只读 snapshot 确认，绝不重发 POST。"""
     content = "# rule"
-    client = FakeAdapterClient(post_responses=[httpx.ConnectError("connection lost")])
+    client = FakeAdapterClient(
+        post_responses=[httpx.ConnectError("connection lost")],
+        snapshot_responses=[_snap("old")],
+    )
     applier = ManagedDocApplier(adapter_client=client, doc_kind="agent_rule")
     with pytest.raises(ManagedDocApplyError):
         applier.apply_and_wait(content)
     assert client.post_calls == 1
+    assert client.snapshot_calls == 1
+
+
+@pytest.mark.parametrize(
+    "snapshot_responses",
+    [
+        [_snap("old", pending_apply=True), _snap("old", pending_apply=True)],
+        [httpx.ConnectError("unreachable"), httpx.ConnectError("still unreachable")],
+    ],
+    ids=["pending-until-timeout", "unreachable-until-timeout"],
+)
+def test_response_loss_confirmation_timeout_never_reposts(
+    snapshot_responses: list[Any],
+) -> None:
+    ticks = [0.0]
+
+    def advance(seconds: float) -> None:
+        ticks[0] += seconds
+
+    client = FakeAdapterClient(
+        post_responses=[httpx.ReadError("response lost")],
+        snapshot_responses=snapshot_responses,
+    )
+    applier = ManagedDocApplier(
+        adapter_client=client,
+        doc_kind="agent_rule",
+        deadline=2.0,
+        poll_interval=1.0,
+        clock=lambda: ticks[0],
+        sleeper=advance,
+    )
+
+    with pytest.raises(ManagedDocApplyError) as exc_info:
+        applier.apply_and_wait("# rule")
+
+    assert exc_info.value.phase == "deadline"
+    assert client.post_calls == 1
+    assert client.snapshot_calls == 2
 
 
 # ── 8. GET transient error continues polling within deadline ──

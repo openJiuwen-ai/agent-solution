@@ -99,9 +99,6 @@ class EvolveConfig(BaseSettings):
     managed_doc_apply_deadline: float = 600.0
     # Must exceed Adapter apply deadline; includes in-flight completion + rollback.
     managed_doc_cancel_rollback_deadline: float = 900.0
-    # Deployment truth: enable only when the configured Adapter exposes a
-    # durable shared operation-receipt store.
-    managed_doc_operation_idempotency: bool = False
     # EVO_MANAGED_DOC_PROTECTED_SECTIONS（JSON）：dict[doc_kind, list[ProtectedSectionConfig]]，
     # key 为精确 doc_kind。默认空（无受保护区段）。runner 映射为 adapter_client ProtectedSection。
     managed_doc_protected_sections: dict[str, list[ProtectedSectionConfig]] = Field(

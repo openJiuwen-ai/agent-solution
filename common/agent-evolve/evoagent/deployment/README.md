@@ -186,7 +186,6 @@ EVO_PARALLELISM=4             # 并发度
 EVO_MANAGED_DOC_APPLY_DEADLINE=600 # AgentRule apply 总等待时限
 EVO_MANAGED_DOC_CANCEL_ROLLBACK_DEADLINE=900 # 必须大于 apply deadline
 EVOAGENT_CONTROL_DB_PATH=./workspace/evoagent-control.db # 必须位于持久卷
-EVO_MANAGED_DOC_OPERATION_IDEMPOTENCY=false # Adapter durable receipt 就绪后才开启
 ```
 
 完整字段见 [config/.env.example](./config/.env.example)。

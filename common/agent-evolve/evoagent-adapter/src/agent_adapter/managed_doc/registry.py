@@ -98,6 +98,13 @@ class ManagedDocRegistry:
             )
         return doc
 
+    def list_for_agent(self, agent_name: str) -> list[ManagedDocConfig]:
+        """Return registered documents for an Agent in configuration order."""
+        by_kind = self._map.get(agent_name)
+        if by_kind is None:
+            raise AgentNotFoundError(f"Agent '{agent_name}' not found")
+        return list(by_kind.values())
+
     def max_task_seconds(self, agent_name: str, doc_kind: str) -> int:
         """Return the cached G2.2 worst-case upper bound (build-time computed).
 

@@ -56,6 +56,27 @@ def test_get_unknown_doc_kind_raises() -> None:
         reg.get("edp", "no_such_kind")
 
 
+def test_list_for_agent_returns_registered_docs_in_config_order() -> None:
+    docs = [
+        ManagedDocConfig(kind="agent_rule", path="/x/AgentRule.md"),
+        ManagedDocConfig(kind="instructions", path="/x/AGENTS.md"),
+    ]
+    reg = ManagedDocRegistry(agents=[_agent(docs=docs)], defaults=ManagedDocDefaults())
+
+    assert [doc.kind for doc in reg.list_for_agent("edp")] == [
+        "agent_rule",
+        "instructions",
+    ]
+
+
+def test_list_for_agent_distinguishes_empty_agent_from_unknown_agent() -> None:
+    reg = ManagedDocRegistry(agents=[_agent(docs=[])], defaults=ManagedDocDefaults())
+
+    assert reg.list_for_agent("edp") == []
+    with pytest.raises(AgentNotFoundError):
+        reg.list_for_agent("missing")
+
+
 # ── AC3.1 restart 无 agent_url 且无 health_url → 启动报错 ─────────────
 
 

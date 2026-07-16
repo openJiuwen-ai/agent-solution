@@ -94,6 +94,26 @@ class ManagedDocService:
             return FileOnlyApply()
         return RestartApply(cfg=cfg, client=self._get_http_client())
 
+    # ── capability listing (sync, read-only) ────────────────────────
+
+    def list_documents(self, agent_name: str) -> dict[str, object]:
+        """Project restart-capable documents onto the safe optimization whitelist."""
+        items: list[dict[str, object]] = []
+        for cfg in self._registry.list_for_agent(agent_name):
+            if cfg.apply != "restart":
+                continue
+            filename = Path(cfg.path).name
+            items.append(
+                {
+                    "doc_kind": cfg.kind,
+                    "display_name": filename,
+                    "filename": filename,
+                    "apply_mode": cfg.apply,
+                    "max_task_seconds": self._registry.max_task_seconds(agent_name, cfg.kind),
+                }
+            )
+        return {"agent_name": agent_name, "items": items, "total": len(items)}
+
     # ── content (sync, spec §6.3) ───────────────────────────────────
 
     def content(self, agent_name: str, doc_kind: str) -> dict[str, object]:

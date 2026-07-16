@@ -8,8 +8,10 @@ sub-cases (malformed action/doc_kind + V2 content validation failure).
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 
+import httpx
 import pytest
 from httpx import ASGITransport, AsyncClient
 
@@ -17,13 +19,19 @@ from agent_adapter.config import load_config
 from agent_adapter.managed_doc.apply import ApplyResult
 from agent_adapter.managed_doc.registry import ManagedDocRegistry
 from agent_adapter.managed_doc.service import ManagedDocService
+from agent_adapter.managed_doc.task import TaskRegistry
 
 RULE_V1 = "---\nauthor: x\n---\n# v1\n"
 RULE_V2 = "---\nauthor: x\n---\n# v2\n"
 BAD_CONTENT = "# no frontmatter\njust body\n"
 
 
-def _build_app(tmp_path: Path, *, strategy_factory=None):
+def _build_app(
+    tmp_path: Path,
+    *,
+    strategy_factory=None,
+    task_registry: TaskRegistry | None = None,
+):
     path = tmp_path / "host" / "edp" / "AgentRule.md"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(RULE_V1, encoding="utf-8")
@@ -40,6 +48,7 @@ def _build_app(tmp_path: Path, *, strategy_factory=None):
     registry = ManagedDocRegistry(agents=config.agents, defaults=config.managed_doc_defaults)
     app.state.managed_doc_service = ManagedDocService(
         registry=registry,
+        task_registry=task_registry,
         strategy_factory=strategy_factory or (lambda cfg: _AlwaysFail()),
     )
     return app, path
@@ -58,6 +67,18 @@ def _assert_contract(resp, status: int, code: str) -> None:
     assert set(err.keys()) == {"code", "message"}, err
     assert err["code"] == code
     assert isinstance(err["message"], str) and err["message"]
+
+
+# ── managed-document capability listing ────────────────────────────
+
+
+async def test_listing_joins_registry_and_http_contract(tmp_path: Path) -> None:
+    app, _ = _build_app(tmp_path)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get("/api/v1/agents/edp/managed-docs")
+
+    assert response.status_code == 200
+    assert response.json() == {"agent_name": "edp", "items": [], "total": 0}
 
 
 # ── INVALID_ACTION (400) — AC14.2 两类 ─────────────────────────────
@@ -184,6 +205,33 @@ async def test_task_not_found(tmp_path: Path) -> None:
         _assert_contract(resp, 404, "TASK_NOT_FOUND")
 
 
+async def test_expired_task_falls_back_to_snapshot_confirmation(tmp_path: Path) -> None:
+    from agent_adapter.managed_doc.storage import DocStorage
+
+    app, _ = _build_app(
+        tmp_path,
+        strategy_factory=lambda cfg: _OkStrategy(),
+        task_registry=TaskRegistry(ttl_seconds=-1),
+    )
+    target_revision = DocStorage.sha256(RULE_V2)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        update = await client.post(
+            "/api/v1/managed-docs",
+            json={
+                "agent_name": "edp",
+                "doc_kind": "agent_rule",
+                "action": "update",
+                "content": RULE_V2,
+            },
+        )
+        task_id = update.json()["task_id"]
+        await app.state.managed_doc_service.join_apply(task_id)
+
+        lost = await client.get(f"/api/v1/managed-docs/tasks/{task_id}")
+        _assert_contract(lost, 404, "TASK_NOT_FOUND")
+        assert await _confirm_target_from_snapshot(client, target_revision) is True
+
+
 # ── INTERNAL_ERROR (500) ────────────────────────────────────────────
 
 
@@ -276,11 +324,65 @@ class _GatedStrategy:
         return self.result
 
 
+class _LoseUpdateResponseTransport(httpx.AsyncBaseTransport):
+    """Let the ASGI side effect run, then simulate loss of the update response."""
+
+    def __init__(self, app: object, *, snapshot_unreachable: bool = False) -> None:
+        self._inner = ASGITransport(app=app)  # type: ignore[arg-type]
+        self._snapshot_unreachable = snapshot_unreachable
+        self.update_post_count = 0
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else {}
+        if body.get("action") == "content" and self._snapshot_unreachable:
+            raise httpx.ConnectError("snapshot unreachable", request=request)
+        response = await self._inner.handle_async_request(request)
+        if (
+            request.method == "POST"
+            and request.url.path == "/api/v1/managed-docs"
+            and body.get("action") == "update"
+        ):
+            self.update_post_count += 1
+            await response.aread()
+            await response.aclose()
+            raise httpx.ReadError("update response lost", request=request)
+        return response
+
+    async def aclose(self) -> None:
+        await self._inner.aclose()
+
+
+async def _confirm_target_from_snapshot(
+    client: AsyncClient,
+    target_revision: str,
+    *,
+    max_reads: int = 3,
+) -> bool:
+    """Test the consumer contract: bounded snapshot reads and no update fallback."""
+    for _ in range(max_reads):
+        try:
+            response = await client.post(
+                "/api/v1/managed-docs",
+                json={"agent_name": "edp", "doc_kind": "agent_rule", "action": "content"},
+            )
+        except httpx.TransportError:
+            continue
+        body = response.json()
+        if body["pending_apply"]:
+            continue
+        return (
+            body["file_revision"] == target_revision
+            and body["applied_revision"] == target_revision
+        )
+    return False
+
+
 async def test_update_same_revision_200_no_op(tmp_path: Path) -> None:
     """C2: 同 revision 重发 → 200 {success, revision, pending_apply:false}，无 task_id。"""
     from agent_adapter.managed_doc.storage import DocStorage
 
     app, path = _build_app(tmp_path, strategy_factory=lambda cfg: _OkStrategy())
+    path.write_text(RULE_V2, encoding="utf-8")
     storage = DocStorage(kind="agent_rule", path=str(path), allow_root=path.parent)
     storage.write_meta(revision=DocStorage.sha256(RULE_V2))
 
@@ -300,6 +402,15 @@ async def test_update_same_revision_200_no_op(tmp_path: Path) -> None:
         assert body["revision"] == DocStorage.sha256(RULE_V2)
         assert body["pending_apply"] is False
         assert "task_id" not in body
+
+        snapshot = await client.post(
+            "/api/v1/managed-docs",
+            json={"agent_name": "edp", "doc_kind": "agent_rule", "action": "content"},
+        )
+        snapshot_body = snapshot.json()
+        assert snapshot_body["pending_apply"] is False
+        assert snapshot_body["file_revision"] == DocStorage.sha256(RULE_V2)
+        assert snapshot_body["applied_revision"] == DocStorage.sha256(RULE_V2)
 
 
 async def test_update_new_revision_202_started_pending(tmp_path: Path) -> None:
@@ -382,3 +493,141 @@ async def test_task_polling_failed_carries_last_error(tmp_path: Path) -> None:
         assert body["status"] == "FAILED"
         assert body["last_error"] == "boom"
         assert body["pending_apply"] is True
+
+
+# ── response-loss recovery uses snapshot only ──────────────────────
+
+
+async def test_lost_update_response_is_confirmed_by_snapshot_revision(tmp_path: Path) -> None:
+    """A caller that loses the 202 body can confirm apply without another update POST."""
+    from agent_adapter.managed_doc.storage import DocStorage
+
+    gated = _GatedStrategy()
+    app, _ = _build_app(tmp_path, strategy_factory=lambda cfg: gated)
+    target_revision = DocStorage.sha256(RULE_V2)
+    transport = _LoseUpdateResponseTransport(app)
+
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        with pytest.raises(httpx.ReadError, match="response lost"):
+            await client.post(
+                "/api/v1/managed-docs",
+                json={
+                    "agent_name": "edp",
+                    "doc_kind": "agent_rule",
+                    "action": "update",
+                    "content": RULE_V2,
+                },
+            )
+
+        pending = await client.post(
+            "/api/v1/managed-docs",
+            json={"agent_name": "edp", "doc_kind": "agent_rule", "action": "content"},
+        )
+        assert pending.json()["pending_apply"] is True
+        assert pending.json()["file_revision"] == target_revision
+
+        gated.release.set()
+        for _ in range(100):
+            snapshot = await client.post(
+                "/api/v1/managed-docs",
+                json={"agent_name": "edp", "doc_kind": "agent_rule", "action": "content"},
+            )
+            body = snapshot.json()
+            if body["pending_apply"] is False:
+                break
+            await asyncio.sleep(0.01)
+        else:  # pragma: no cover
+            pytest.fail("snapshot never reached a stable applied revision")
+
+        assert body["file_revision"] == target_revision
+        assert body["applied_revision"] == target_revision
+        assert transport.update_post_count == 1
+
+
+async def test_lost_response_pending_snapshot_times_out_without_second_update(
+    tmp_path: Path,
+) -> None:
+    from agent_adapter.managed_doc.storage import DocStorage
+
+    gated = _GatedStrategy()
+    app, _ = _build_app(tmp_path, strategy_factory=lambda cfg: gated)
+    target_revision = DocStorage.sha256(RULE_V2)
+    transport = _LoseUpdateResponseTransport(app)
+
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        with pytest.raises(httpx.ReadError):
+            await client.post(
+                "/api/v1/managed-docs",
+                json={
+                    "agent_name": "edp",
+                    "doc_kind": "agent_rule",
+                    "action": "update",
+                    "content": RULE_V2,
+                },
+            )
+
+        assert await _confirm_target_from_snapshot(client, target_revision) is False
+        assert transport.update_post_count == 1
+        gated.release.set()
+        await asyncio.sleep(0.01)
+
+
+async def test_lost_response_unreachable_snapshot_fails_without_second_update(
+    tmp_path: Path,
+) -> None:
+    from agent_adapter.managed_doc.storage import DocStorage
+
+    gated = _GatedStrategy()
+    app, _ = _build_app(tmp_path, strategy_factory=lambda cfg: gated)
+    target_revision = DocStorage.sha256(RULE_V2)
+    transport = _LoseUpdateResponseTransport(app, snapshot_unreachable=True)
+
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        with pytest.raises(httpx.ReadError):
+            await client.post(
+                "/api/v1/managed-docs",
+                json={
+                    "agent_name": "edp",
+                    "doc_kind": "agent_rule",
+                    "action": "update",
+                    "content": RULE_V2,
+                },
+            )
+
+        assert await _confirm_target_from_snapshot(client, target_revision) is False
+        assert transport.update_post_count == 1
+        gated.release.set()
+        await asyncio.sleep(0.01)
+
+
+async def test_snapshot_exposes_stable_mismatch_after_later_write(tmp_path: Path) -> None:
+    """A stable non-target revision remains distinguishable from successful recovery."""
+    from agent_adapter.managed_doc.storage import DocStorage
+
+    app, _ = _build_app(tmp_path, strategy_factory=lambda cfg: _OkStrategy())
+    target_revision = DocStorage.sha256(RULE_V2)
+    later_revision = DocStorage.sha256("---\nauthor: x\n---\n# later\n")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        for content in (RULE_V2, "---\nauthor: x\n---\n# later\n"):
+            update = await client.post(
+                "/api/v1/managed-docs",
+                json={
+                    "agent_name": "edp",
+                    "doc_kind": "agent_rule",
+                    "action": "update",
+                    "content": content,
+                },
+            )
+            await app.state.managed_doc_service.join_apply(update.json()["task_id"])
+
+        snapshot = await client.post(
+            "/api/v1/managed-docs",
+            json={"agent_name": "edp", "doc_kind": "agent_rule", "action": "content"},
+        )
+        body = snapshot.json()
+        assert body["pending_apply"] is False
+        assert body["file_revision"] == later_revision
+        assert body["applied_revision"] == later_revision
+        assert body["applied_revision"] != target_revision
+        assert await _confirm_target_from_snapshot(client, target_revision) is False

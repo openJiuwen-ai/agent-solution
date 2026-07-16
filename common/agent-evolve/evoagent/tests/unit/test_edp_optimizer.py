@@ -2458,14 +2458,14 @@ async def test_select_override_pushes_select_event() -> None:
 
 @pytest.fixture
 def real_edp_cls() -> Any:
-    """动态加载真实 scenarios/edp_agent/optimizer.py 的 EDPAgentOptimizer 类。
+    """动态加载真实 examples/scenarios/edp_agent/optimizer.py 的 EDPAgentOptimizer 类。
 
     edp_cls fixture 加载的是 _OPTIMIZER_CODE 副本，无法覆盖对真实 optimizer 文件
     的改动；F10 直接验证真实 _build_analyst_prompt 实现。
     """
     import importlib.util
 
-    path = Path("scenarios/edp_agent/optimizer.py").resolve()
+    path = Path("examples/scenarios/edp_agent/optimizer.py").resolve()
     spec = importlib.util.spec_from_file_location("_real_edp_opt", path)
     assert spec and spec.loader
     mod = importlib.util.module_from_spec(spec)

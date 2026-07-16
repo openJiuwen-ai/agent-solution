@@ -59,9 +59,9 @@ uv run uvicorn evo_agent.api.app:app --host 0.0.0.0 --port 8001
 ## 项目结构
 
 ```
-community/EvoAgent/
+common/agent-evolve/evoagent/
 ├── skills/optimize_skill/     # Agent Skill (SKILL.md + scripts)
-├── scenarios/                 # 场景配置（edp_agent / example）
+├── examples/scenarios/        # 场景配置（edp_agent / example）
 │   └── edp_agent/             #   场景目录（scenario.yaml + optimizer.py + prompts/）
 ├── src/evo_agent/             # Python 包
 │   ├── config.py              # 配置管理 (pydantic-settings)
@@ -93,7 +93,7 @@ community/EvoAgent/
 
 ## 场景开发
 
-`scenarios/` 目录下每个子目录代表一个业务场景（如 `edp_agent`）。开发新场景时创建目录并包含：
+`examples/scenarios/` 目录下每个子目录代表一个业务场景（如 `edp_agent`）。开发新场景时创建目录并包含：
 
 - `scenario.yaml`: 场景配置（adapter_url、optimizer_class、skills 列表、rollout 配置）
 - `optimizer.py`: 场景 optimizer 子类（继承 `SkillDocumentOptimizer`，覆写 `_rollout()` 等方法）

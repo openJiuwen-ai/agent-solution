@@ -70,6 +70,35 @@ def test_orphan_tool_result_is_rejected_instead_of_emitted() -> None:
         )
 
 
+def test_unpaired_tool_call_does_not_create_a_missing_error_result() -> None:
+    """配对信息不完整时保留原始证据，不得伪造 tool error。"""
+    trajectory = {
+        "messages": [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "function": {"name": "search", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "name": "search", "content": "REAL RESULT"},
+        ]
+    }
+
+    result = compact_trajectory(
+        trajectory,
+        policy=TrajectoryCompactionPolicy(stage="evaluator"),
+        context=TrajectoryCompactionContext(),
+        token_budget=1000,
+    )
+
+    messages = json.loads(result.text)["messages"]
+    assert messages == trajectory["messages"]
+    assert "TOOL_RESULT_MISSING" not in result.text
+
+
 def test_optimizer_trajectory_adapts_to_the_same_paired_event_view() -> None:
     """optimizer Trajectory 也必须进入共享 call/result 保真视图。"""
     arguments = '{"query":"exact value"}'

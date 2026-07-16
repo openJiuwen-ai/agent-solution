@@ -103,9 +103,9 @@ def test_evaluate_uses_unique_conversation_ids() -> None:
     # Each case should have a unique conversation_id
     assert len(invoked_ids) == 3
     assert len(set(invoked_ids)) == 3  # All unique
-    # Format: run1:val:{n}:{case_id}
+    # Format: run1_val_{n}_{case_id}
     for cid in invoked_ids:
-        assert cid.startswith("run1:val:")
+        assert cid.startswith("run1_val_")
 
 
 def test_evaluate_injects_trajectory() -> None:

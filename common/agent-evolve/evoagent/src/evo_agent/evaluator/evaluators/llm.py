@@ -37,7 +37,6 @@ from evo_agent.evaluator.prompts.formatter import (
 from evo_agent.evaluator.prompts.policy_v1 import (
     DEFAULT_PROMPT_TEMPLATE,
 )
-from evo_agent.evaluator.trajectory.simplify import simplify_trajectory
 from evo_agent.llm.invocation import (
     LLMInvocation,
     LLMInvocationContext,
@@ -592,29 +591,6 @@ def _inject_custom_instruction(custom_instruction: str) -> str:
     """
     _role, _sep, rest = DEFAULT_PROMPT_TEMPLATE.partition("\n\n")
     return f"{custom_instruction}\n\n{rest}"
-
-
-def _simplify_for_prompt(
-    trajectory_data: Any,
-) -> tuple[str, list[str]]:
-    """Simplify a trajectory and extract warnings for the evaluation prompt.
-
-    B3 (#5): 直接把 raw dict / StandardTrajectory 喂给 ``simplify_trajectory``，
-    跳过 ``StandardTrajectory.model_validate`` 的 dict→object→dict 往返。
-    仅在 simplify 自身抛错时回退为原始 JSON dump。
-    """
-    try:
-        simplified = simplify_trajectory(trajectory_data)
-    except Exception:
-        return (
-            json.dumps(trajectory_data, ensure_ascii=False, default=str),
-            [],
-        )
-
-    return (
-        json.dumps(simplified.model_dump(), ensure_ascii=False, default=str),
-        simplified.warnings,
-    )
 
 
 def _build_format_retry_prompt(prompt: str, enable_attribution: bool) -> str:

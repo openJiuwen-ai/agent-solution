@@ -68,10 +68,8 @@ def compact_trajectory(
             original["target_skills"] = list(context.target_skills)
     before_text = _dump(original)
     view = copy.deepcopy(original)
-    if policy.stage == "artifact_validation":
-        _redact_artifact_view(view)
     messages = _messages(view)
-    _validate_tool_pairing(messages)
+    _reject_orphan_tool_results(messages)
     truncated = 0
     omitted = 0
     tool_message_indexes: list[int] = []
@@ -221,54 +219,6 @@ def _is_error_result(message: dict[str, Any], content: str) -> bool:
     )
 
 
-def _redact_artifact_view(value: Any) -> None:
-    """Remove customer values while retaining roles, tool pairing, and field shape."""
-    try:
-        messages = _messages(value)
-    except TrajectoryCompactionError:
-        return
-    for message in messages:
-        if not isinstance(message, dict):
-            continue
-        content = message.get("content")
-        if isinstance(content, str) and content:
-            role = str(message.get("role", "unknown"))
-            status = " error" if _is_error_result(message, content) else ""
-            message["content"] = (
-                f"[ARTIFACT_REDACTED role={role}{status} original_chars={len(content)}]"
-            )
-        tool_calls = message.get("tool_calls")
-        if not isinstance(tool_calls, list):
-            continue
-        for tool_call in tool_calls:
-            if not isinstance(tool_call, dict):
-                continue
-            function = tool_call.get("function")
-            if not isinstance(function, dict) or "arguments" not in function:
-                continue
-            function["arguments"] = _redact_arguments(function["arguments"])
-
-
-def _redact_arguments(arguments: Any) -> Any:
-    if isinstance(arguments, str):
-        try:
-            parsed = json.loads(arguments)
-        except json.JSONDecodeError:
-            return f"[ARTIFACT_REDACTED original_chars={len(arguments)}]"
-        return json.dumps(_redact_argument_value(parsed), ensure_ascii=False, separators=(",", ":"))
-    return _redact_argument_value(arguments)
-
-
-def _redact_argument_value(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {key: _redact_argument_value(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_redact_argument_value(item) for item in value]
-    if isinstance(value, str):
-        return f"[REDACTED original_chars={len(value)}]"
-    return value
-
-
 def _prompt_safe_view(value: Any) -> Any:
     """Drop non-contract message diagnostics while preserving full tool arguments."""
     if not isinstance(value, dict) or not isinstance(value.get("messages"), list):
@@ -308,9 +258,8 @@ def _prompt_safe_view(value: Any) -> Any:
     return result
 
 
-def _validate_tool_pairing(messages: list[Any]) -> None:
+def _reject_orphan_tool_results(messages: list[Any]) -> None:
     call_ids: set[str] = set()
-    result_ids: set[str] = set()
     for message in messages:
         if not isinstance(message, dict):
             continue
@@ -322,33 +271,8 @@ def _validate_tool_pairing(messages: list[Any]) -> None:
         if message.get("role") == "tool":
             result_id = message.get("tool_call_id")
             if isinstance(result_id, str) and result_id:
-                result_ids.add(result_id)
                 if result_id not in call_ids:
                     raise TrajectoryCompactionError(f"orphan tool result: tool_call_id={result_id}")
-    orphan_calls = call_ids.difference(result_ids)
-    if not orphan_calls:
-        return
-    paired_messages: list[Any] = []
-    for message in messages:
-        paired_messages.append(message)
-        if not isinstance(message, dict):
-            continue
-        calls = message.get("tool_calls")
-        if not isinstance(calls, list):
-            continue
-        for call in calls:
-            call_id = call.get("id") if isinstance(call, dict) else None
-            if not isinstance(call_id, str) or call_id not in orphan_calls:
-                continue
-            paired_messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": call_id,
-                    "content": "[TOOL_RESULT_MISSING original_chars=0]",
-                    "status": "error",
-                }
-            )
-    messages[:] = paired_messages
 
 
 __all__ = [

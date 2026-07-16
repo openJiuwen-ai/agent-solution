@@ -1017,9 +1017,9 @@ async def test_rollout_uses_unique_conversation_id(edp_cls: type) -> None:
     call_args = agent.invoke.call_args[0][0]
     conv_id = call_args["conversation_id"]
     assert conv_id != "c1"
-    # 格式为 "{run_id}:train:{n}:{case_id}"
-    assert conv_id.startswith("run1:train:")
-    assert conv_id.endswith(":c1")
+    # 格式为 "{run_id}_train_{n}_{case_id}"
+    assert conv_id.startswith("run1_train_")
+    assert conv_id.endswith("_c1")
 
 
 @pytest.mark.asyncio

@@ -93,7 +93,7 @@ agents:
     agent_id: "edp_agent"                     # URL path segment: /v1/{project_id}/agents/{agent_id}/...
     timeout: 300                              # Call timeout in seconds
     # ── Managed-doc（可选，需优化 AgentRule.md 等"焙进单例、改文件不热加载"的文档）──
-    # 详见已跟踪 docs/deployment-guide.md §3.5.6。apply=restart 时由部署侧提供 restart_cmd + health 探测；
+    # 详见离线包 README 的 AgentRule managed-doc 章节。apply=restart 时由部署侧提供 restart_cmd + health 探测；
     # adapter async 执行 restart_cmd + health-watch，重启窗口内不阻塞事件循环。
     # managed_docs:
     #   - kind: agent_rule                       # doc 种类（端点 doc_kind）
@@ -140,7 +140,7 @@ agents:
 
 # ── Managed-doc defaults（可选，仅当任一 agent 配了 managed_docs 且 apply=restart 时生效）──
 # profile 决定 burst（canary 训练，快速失败）vs single（人工单次）两套默认基线；
-# 显式字段覆写优先于 profile 基线。详见 docs/deployment-guide.md §3.5.6 与 spec §8.4。
+# 显式字段覆写优先于 profile 基线；字段语义见下方内联说明。
 # managed_doc_defaults:
 #   profile: burst                # burst | single
 #   task_ttl_seconds: 600         # 完成态任务保留时长（轮询窗口）

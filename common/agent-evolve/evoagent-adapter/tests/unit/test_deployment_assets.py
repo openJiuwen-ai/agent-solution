@@ -49,20 +49,20 @@ def test_runtime_image_contains_docker_cli_package() -> None:
     assert " docker.io" not in dockerfile
 
 
-def test_tracked_guide_contains_managed_doc_bootstrap() -> None:
-    guide = (_ROOT / "docs" / "deployment-guide.md").read_text(encoding="utf-8")
+def test_exported_readme_contains_managed_doc_bootstrap() -> None:
+    exporter = (_DEPLOYMENT / "export-bundle.sh").read_text(encoding="utf-8")
 
-    assert "AgentRule managed-doc 配置与首启 bootstrap" in guide
-    assert '"action": "update"' in guide
-    assert 'state["down_seen"] is True' in guide
-    assert "exec -T adapter python" in guide
-    assert "managed-doc-deploy.md" not in guide
+    assert "AgentRule managed-doc（按需启用）" in exporter
+    assert "ADAPTER_ENABLE_DOCKER_RESTART=true" in exporter
+    assert "action=update" in exporter
+    assert "pending_apply=false" in exporter
+    assert "HOST_AGENTS_ROOT" in exporter
 
     config_template = (_DEPLOYMENT / "config" / "agent_adapter_config.yaml").read_text(
         encoding="utf-8"
     )
+    assert "docs/deployment-guide.md" not in config_template
     assert "managed-doc-deploy.md" not in config_template
-    assert "docs/deployment-guide.md §3.5.6" in config_template
 
 
 def test_offline_readme_uses_current_host_variable_names() -> None:

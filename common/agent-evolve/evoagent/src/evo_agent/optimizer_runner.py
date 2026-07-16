@@ -12,6 +12,7 @@ import hashlib
 import json
 import math
 import os
+import time
 import uuid
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -23,6 +24,7 @@ from openjiuwen.core.foundation.llm.model import Model
 from openjiuwen.core.foundation.llm.schema.config import ModelClientConfig, ModelRequestConfig
 from openjiuwen.core.single_agent import AgentCard
 
+from evo_agent.adapter_client.applier import AppliedDocument, ManagedDocApplier
 from evo_agent.adapter_client.client import AdapterClient
 from evo_agent.adapter_client.content_policy import (
     ContentPolicy,
@@ -37,17 +39,24 @@ from evo_agent.adapter_client.operator import (
 from evo_agent.adapter_client.remote_agent import RemoteAgent
 from evo_agent.adapter_client.types import ManagedDocSnapshot
 from evo_agent.callbacks import build_callbacks
+from evo_agent.cancellation import CancellationRequestedError, CancellationToken
 from evo_agent.config import EvolveConfig
 from evo_agent.conversation import ConversationIdFactory
 from evo_agent.dataset.manifest import build_dataset_from_request, load_dataset_manifest
-from evo_agent.errors import ManagedDocBaselineError
+from evo_agent.errors import (
+    ArtifactConsistencyError,
+    CancelRollbackError,
+    ManagedDocApplyError,
+    ManagedDocBaselineChangedError,
+    ManagedDocBaselineError,
+)
 from evo_agent.llm.invocation import LLMInvocation, LLMProviderCapabilities
 from evo_agent.optimizer.concurrency import gather_with_semaphore
 from evo_agent.reporter.formatter import ReportFormatter
 from evo_agent.runtime_config import OptimizationConfigResolver
 from evo_agent.scenario.registry import ScenarioRegistry
 from evo_agent.trainer import EvoTrainer
-from evo_agent.types import OptimizeReport, OptimizeRequest
+from evo_agent.types import ManagedDocEpochContent, OptimizeReport, OptimizeRequest
 
 # ── managed-doc job-start baseline + artifacts (spec F7 / F8) ──────────────
 
@@ -151,6 +160,29 @@ def _validate_managed_doc_baseline(
     _ = diag
 
 
+def _validate_expected_managed_doc_revision(
+    snapshot: ManagedDocSnapshot,
+    *,
+    agent_name: str,
+    doc_kind: str,
+    expected_revision: str,
+) -> None:
+    """Prove an Adapter snapshot is the Studio-persisted baseline revision."""
+    if (
+        snapshot.pending_apply
+        or snapshot.file_revision != expected_revision
+        or snapshot.applied_revision != expected_revision
+    ):
+        raise ManagedDocBaselineChangedError(
+            agent_name=agent_name,
+            doc_kind=doc_kind,
+            expected_revision=expected_revision,
+            file_revision=snapshot.file_revision,
+            applied_revision=snapshot.applied_revision,
+            pending_apply=snapshot.pending_apply,
+        )
+
+
 def _build_managed_doc_content_policy(
     config: EvolveConfig,
     *,
@@ -222,6 +254,89 @@ def _write_managed_doc_tasks_json(
     return task_ids
 
 
+def rollback_managed_doc(
+    *,
+    adapter_client: AdapterClient,
+    doc_kind: str,
+    baseline_content: str,
+    baseline_revision: str,
+    operation_id: str,
+    deadline: float,
+    phase_callback: Any | None = None,
+    clock: Callable[[], float] = time.monotonic,
+) -> AppliedDocument:
+    """Restore and re-confirm the immutable job-start baseline."""
+    started_at = clock()
+    if phase_callback is not None:
+        phase_callback(
+            "log",
+            {
+                "level": "info",
+                "message": f"Restoring managed-doc baseline: doc_kind={doc_kind}",
+                "phase": "rollback_started",
+            },
+        )
+    applier = ManagedDocApplier(
+        adapter_client=adapter_client,
+        doc_kind=doc_kind,
+        deadline=deadline,
+        operation_id=operation_id,
+    )
+    try:
+        result = applier.apply_and_wait(baseline_content)
+        remaining = deadline - (clock() - started_at)
+        if remaining <= 0:
+            raise CancelRollbackError(
+                code="CANCEL_ROLLBACK_TIMEOUT",
+                diagnostics="total cancellation recovery deadline exhausted before confirmation",
+            )
+        snapshot = adapter_client.get_managed_doc_sync(doc_kind, request_timeout=remaining)
+        if clock() - started_at > deadline:
+            raise CancelRollbackError(
+                code="CANCEL_ROLLBACK_TIMEOUT",
+                diagnostics="total cancellation recovery deadline exhausted during confirmation",
+            )
+        if (
+            snapshot.pending_apply
+            or snapshot.file_revision != baseline_revision
+            or snapshot.applied_revision != baseline_revision
+        ):
+            raise CancelRollbackError(
+                code="CANCEL_ROLLBACK_FAILED",
+                diagnostics=(
+                    f"pending_apply={snapshot.pending_apply} "
+                    f"file_revision={snapshot.file_revision} "
+                    f"applied_revision={snapshot.applied_revision} "
+                    f"expected_revision={baseline_revision}"
+                ),
+            )
+    except CancelRollbackError:
+        raise
+    except ManagedDocApplyError as exc:
+        code = "CANCEL_ROLLBACK_TIMEOUT" if exc.phase == "deadline" else "CANCEL_ROLLBACK_FAILED"
+        raise CancelRollbackError(
+            code=code,
+            diagnostics=(f"phase={exc.phase} task_id={exc.task_id} doc_kind={exc.doc_kind}"),
+        ) from exc
+    except Exception as exc:
+        # Verification/transport failures are terminal too. Keep diagnostics
+        # type-only so an Adapter response cannot leak managed-document text.
+        raise CancelRollbackError(
+            code="CANCEL_ROLLBACK_FAILED",
+            diagnostics=f"{type(exc).__name__}: rollback verification unavailable",
+        ) from exc
+    if phase_callback is not None:
+        phase_callback(
+            "log",
+            {
+                "level": "info",
+                "message": f"Managed-doc baseline restored: doc_kind={doc_kind}",
+                "phase": "rollback_completed",
+            },
+        )
+    return result
+
+
 async def _setup_managed_doc_baseline(
     *,
     adapter_client: Any,
@@ -231,6 +346,7 @@ async def _setup_managed_doc_baseline(
     run_artifact_dir: Path,
     config: EvolveConfig,
     phase_callback: Any | None,
+    cancellation_token: CancellationToken | None = None,
 ) -> tuple[ManagedDocSnapshot, Any]:
     """job-start baseline：读 snapshot → 写 observed/diagnostics → 校验 → 写 before → 建 operator。
 
@@ -287,6 +403,8 @@ async def _setup_managed_doc_baseline(
         # file/applied revision 都等于期望 content hash），用它初始化 Applier
         # last_success_hash → baseline 内容首次 set_parameter 时 hash 命中 no-op。
         last_success_hash=snapshot.applied_revision,
+        cancellation_token=cancellation_token,
+        phase_callback=phase_callback,
     )
     return snapshot, operator
 
@@ -297,6 +415,8 @@ async def run_optimization(
     *,
     progress_callback: Any | None = None,
     phase_callback: Any | None = None,
+    cancellation_token: CancellationToken | None = None,
+    managed_doc_baseline_callback: Callable[[ManagedDocSnapshot], None] | None = None,
 ) -> OptimizeReport:
     """运行一次远程 skill 文档优化。
 
@@ -309,6 +429,8 @@ async def run_optimization(
     - 调用 trainer.train()
     - 返回 ReportFormatter 汇总结果
     """
+    token = cancellation_token or CancellationToken()
+    token.raise_if_requested()
     structlog.get_logger().debug(
         "run_optimization started",
         scenario=request.scenario,
@@ -375,7 +497,17 @@ async def run_optimization(
                 run_artifact_dir=run_artifact_dir,
                 config=config,
                 phase_callback=phase_callback,
+                cancellation_token=token,
             )
+            if resolved.managed_doc_expected_revision is not None:
+                _validate_expected_managed_doc_revision(
+                    managed_snapshot,
+                    agent_name=resolved.agent_name,
+                    doc_kind=managed_doc_kind,
+                    expected_revision=resolved.managed_doc_expected_revision,
+                )
+            if managed_doc_baseline_callback is not None:
+                managed_doc_baseline_callback(managed_snapshot)
             operators = {canonical_id: managed_operator}
         else:
             if phase_callback is not None:
@@ -514,6 +646,7 @@ async def run_optimization(
             # Trace 重试配置（Adapter 日志采集 + cleaned-traces 清洗可能超过 50s）
             # Wave 10 新增：注入 phase_callback（SSE 阶段事件推送）
             "phase_callback": phase_callback or (lambda *a, **kw: None),
+            "cancellation_token": token,
         }
 
         # 7. 通过 ScenarioRegistry 构建场景 optimizer
@@ -542,6 +675,7 @@ async def run_optimization(
             validation_min_success_ratio=resolved.validation_min_success_ratio,
             validation_require_same_case_set=resolved.validation_require_same_case_set,
             early_stop_score=1.01,  # prevent early stop at perfect 1.0
+            cancellation_token=token,
         )
 
         # 更新 ProgressCallback 的 case 数量（dataset 在此处才可用）
@@ -589,6 +723,19 @@ async def run_optimization(
             adapter_client._async_http_loop = None
 
         # 9. 训练（Trainer.train 是同步的，在独立线程中运行）
+        # Prompt 的 expected revision 来自 Studio 持久化 baseline。baseline eval 可能
+        # 耗时较长，因此在任何 candidate apply 可能发生前再次读取并 fail-closed。
+        if managed_doc_kind is not None and resolved.managed_doc_expected_revision is not None:
+            pre_apply_snapshot = await asyncio.to_thread(
+                adapter_client.get_managed_doc_sync, managed_doc_kind
+            )
+            _validate_expected_managed_doc_revision(
+                pre_apply_snapshot,
+                agent_name=resolved.agent_name,
+                doc_kind=managed_doc_kind,
+                expected_revision=resolved.managed_doc_expected_revision,
+            )
+
         # managed-doc 模式：try/finally 在 apply 异常时也刷新 managed_doc_tasks.json
         # （applier records ledger，失败路径诊断数据源）；finally 写盘失败只追加
         # suppressed diagnostic，不覆盖原始 fatal 异常（spec F8）。
@@ -628,8 +775,11 @@ async def run_optimization(
         # 10. 汇总 artifact
         # 报告趋势图用候选 fresh eval 分数（每轮真实评估，会波动）；门控赢家
         # （val_per_epoch_scores，单调非降）仅 ProgressCallback 内部用于 improved 判定。
+        gate_epoch_scores = trainer.gate_epoch_scores
         val_candidate_scores = (
-            tuple(progress_callback.candidate_per_epoch_scores) if progress_callback else ()
+            tuple(progress_callback.candidate_per_epoch_scores)
+            if progress_callback
+            else tuple(float(item["candidate_score"]) for item in gate_epoch_scores)
         )
         val_score_before = progress_callback.val_score_before if progress_callback else 0.0
         val_per_epoch_case_scores = (
@@ -649,6 +799,22 @@ async def run_optimization(
             managed_operator.applier.records if managed_operator is not None else ()
         )
         managed_doc_task_ids = tuple(r.task_id for r in managed_doc_records if r.task_id)
+        captured_managed_doc_contents = (
+            trainer.managed_doc_epoch_contents(canonical_id)
+            if is_managed_doc and canonical_id is not None
+            else ()
+        )
+        if is_managed_doc and (
+            len(captured_managed_doc_contents) != len(val_candidate_scores)
+            or len(captured_managed_doc_contents) != len(gate_epoch_scores)
+        ):
+            raise ArtifactConsistencyError(
+                "managed-doc candidate, validation score, and gate round counts differ"
+            )
+        managed_doc_epoch_contents = tuple(
+            ManagedDocEpochContent(round=index, content=content)
+            for index, content in enumerate(captured_managed_doc_contents, start=1)
+        )
         report_skills = (canonical_id,) if is_managed_doc and canonical_id else resolved.skills
         return ReportFormatter(
             run_artifact_dir,
@@ -661,9 +827,126 @@ async def run_optimization(
             managed_doc_kind=managed_doc_kind,
             managed_doc_content_before=managed_doc_before,
             managed_doc_content_after=managed_doc_after,
+            managed_doc_epoch_contents=managed_doc_epoch_contents,
             managed_doc_task_ids=managed_doc_task_ids,
             managed_doc_records=managed_doc_records,
         ).format()
+
+
+async def run_optimization_with_cancellation_recovery(
+    request: OptimizeRequest,
+    config: EvolveConfig,
+    *,
+    operation_id: str,
+    progress_callback: Any | None = None,
+    phase_callback: Any | None = None,
+    cancellation_token: CancellationToken | None = None,
+) -> OptimizeReport:
+    """Run optimization and own the complete cooperative-cancel recovery protocol.
+
+    The interface deliberately hides baseline retention, Adapter construction,
+    total-deadline accounting, rollback confirmation, and failure phase emission
+    from HTTP callers.
+    """
+    token = cancellation_token or CancellationToken()
+    verified_baseline: ManagedDocSnapshot | None = None
+
+    def _remember_verified_baseline(snapshot: ManagedDocSnapshot) -> None:
+        nonlocal verified_baseline
+        verified_baseline = snapshot
+
+    try:
+        report = await run_optimization(
+            request,
+            config,
+            progress_callback=progress_callback,
+            phase_callback=phase_callback,
+            cancellation_token=token,
+            managed_doc_baseline_callback=_remember_verified_baseline,
+        )
+        # Close the race where cancellation arrives after the runner's last
+        # cooperative safe point but before the wrapper publishes completion.
+        token.raise_if_requested()
+        return report
+    except Exception as original:
+        if not token.is_requested:
+            raise
+        try:
+            if request.managed_doc_kind is not None:
+                remaining = token.remaining_seconds(config.managed_doc_cancel_rollback_deadline)
+                if remaining <= 0:
+                    raise CancelRollbackError(
+                        code="CANCEL_ROLLBACK_TIMEOUT",
+                        diagnostics="total cancellation recovery deadline exhausted",
+                    )
+                baseline_revision = request.managed_doc_expected_revision or (
+                    verified_baseline.file_revision if verified_baseline is not None else None
+                )
+                if baseline_revision is None:
+                    raise CancelRollbackError(
+                        code="CANCEL_ROLLBACK_FAILED",
+                        diagnostics="verified baseline revision unavailable",
+                    )
+                async with AdapterClient(
+                    request.adapter_url,
+                    agent_name=request.agent_name,
+                    timeout=config.remote_timeout,
+                    max_retries=config.remote_max_retries,
+                ) as rollback_client:
+                    if verified_baseline is None:
+                        try:
+                            snapshot = await asyncio.wait_for(
+                                asyncio.to_thread(
+                                    rollback_client.get_managed_doc_sync,
+                                    request.managed_doc_kind,
+                                    request_timeout=remaining,
+                                ),
+                                timeout=remaining,
+                            )
+                            _validate_expected_managed_doc_revision(
+                                snapshot,
+                                agent_name=request.agent_name,
+                                doc_kind=request.managed_doc_kind,
+                                expected_revision=baseline_revision,
+                            )
+                        except TimeoutError as exc:
+                            raise CancelRollbackError(
+                                code="CANCEL_ROLLBACK_TIMEOUT",
+                                diagnostics="baseline confirmation exceeded cancellation deadline",
+                            ) from exc
+                        except Exception as exc:
+                            raise CancelRollbackError(
+                                code="CANCEL_ROLLBACK_FAILED",
+                                diagnostics=(
+                                    f"{type(exc).__name__}: baseline confirmation unavailable"
+                                ),
+                            ) from exc
+                    else:
+                        await asyncio.to_thread(
+                            rollback_managed_doc,
+                            adapter_client=rollback_client,
+                            doc_kind=request.managed_doc_kind,
+                            baseline_content=verified_baseline.content,
+                            baseline_revision=baseline_revision,
+                            operation_id=operation_id,
+                            deadline=remaining,
+                            phase_callback=phase_callback,
+                        )
+        except CancelRollbackError as rollback_error:
+            if phase_callback is not None:
+                phase_callback(
+                    "log",
+                    {
+                        "level": "error",
+                        "message": "Managed-doc rollback failed",
+                        "phase": "rollback_failed",
+                        "data": {"code": rollback_error.code},
+                    },
+                )
+            raise
+        raise CancellationRequestedError(
+            "optimization cancelled and recovery completed"
+        ) from original
 
 
 async def _build_operators(

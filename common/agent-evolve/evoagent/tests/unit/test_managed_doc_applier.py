@@ -21,10 +21,12 @@ from evo_agent.adapter_client.applier import (
 from evo_agent.adapter_client.client import AdapterError
 from evo_agent.adapter_client.types import (
     AlreadyApplied,
+    ManagedDocOperationReceipt,
     ManagedDocSnapshot,
     TaskState,
     UpdateStarted,
 )
+from evo_agent.cancellation import CancellationToken
 from evo_agent.errors import ManagedDocApplyError
 
 
@@ -129,6 +131,90 @@ def test_applier_succeeded_updates_hash_and_returns_task_id() -> None:
     assert doc.task_id == "task-1"
     assert doc.final_status == "SUCCEEDED"
     assert applier.last_success_hash == h
+
+
+def test_operation_receipt_recovers_original_task_after_post_response_loss() -> None:
+    content = "# baseline restore"
+    revision = _hash(content)
+
+    class ReceiptClient(FakeAdapterClient):
+        operation_calls = 0
+
+        def start_managed_doc_update_sync(
+            self,
+            kind: str,
+            content: str,
+            *,
+            request_timeout: float | None = None,
+            operation_id: str | None = None,
+        ) -> Any:
+            self.post_calls += 1
+            raise httpx.ReadError("response lost")
+
+        def get_managed_doc_operation_sync(
+            self, operation_id: str, *, request_timeout: float | None = None
+        ) -> ManagedDocOperationReceipt:
+            self.operation_calls += 1
+            return ManagedDocOperationReceipt(
+                operation_id=operation_id,
+                status="RUNNING",
+                task_id="original-task",
+                target_revision=revision,
+                last_error=None,
+            )
+
+    client = ReceiptClient(
+        task_responses=[
+            TaskState(
+                status="SUCCEEDED",
+                task_id="original-task",
+                revision=revision,
+                pending_apply=False,
+                last_error=None,
+                attempts=1,
+                down_seen=True,
+                created_at=None,
+                updated_at=None,
+            )
+        ]
+    )
+    applier = ManagedDocApplier(
+        adapter_client=client,  # type: ignore[arg-type]
+        doc_kind="agent_rule",
+        operation_id="evo-cancel:job-1",
+        sleeper=lambda _: None,
+    )
+
+    result = applier.apply_and_wait(content)
+
+    assert result.task_id == "original-task"
+    assert client.post_calls == 1
+    assert client.operation_calls == 1
+
+
+def test_cancellation_during_apply_emits_waiting_but_polls_to_terminal() -> None:
+    content = "# candidate"
+    revision = _hash(content)
+    token = CancellationToken()
+    token.request()
+    phases: list[str] = []
+    client = FakeAdapterClient(
+        post_responses=[UpdateStarted(task_id="task-1")],
+        task_responses=[_task("RUNNING"), _task("SUCCEEDED", revision=revision)],
+    )
+    applier = ManagedDocApplier(
+        adapter_client=client,  # type: ignore[arg-type]
+        doc_kind="agent_rule",
+        cancellation_token=token,
+        phase_callback=lambda _event, data: phases.append(data["phase"]),
+        sleeper=lambda _: None,
+    )
+
+    result = applier.apply_and_wait(content)
+
+    assert result.final_status == "SUCCEEDED"
+    assert client.task_calls == 2
+    assert phases == ["cancel_waiting_inflight"]
 
 
 # ── 2. AlreadyApplied 200 confirmed noop ──

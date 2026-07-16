@@ -81,6 +81,10 @@ class EvolveConfig(BaseSettings):
     workspace_root: Path = Path("./workspace")
     output_root: Path = Path("./workspace/outputs")
     artifact_dir: Path = Path("./workspace/artifacts")
+    evoagent_control_db_path: Path = Field(
+        default=Path("./workspace/evoagent-control.db"),
+        validation_alias="EVOAGENT_CONTROL_DB_PATH",
+    )
 
     # ── Wave 8: 平台 API 配置 ──
     adapter_url: str = ""  # EVO_ADAPTER_URL — Adapter sidecar 地址
@@ -93,6 +97,11 @@ class EvolveConfig(BaseSettings):
     # EVO_MANAGED_DOC_APPLY_DEADLINE：apply 同步等待总时限（秒），默认 600s。
     # job-start 校验 deadline ≥ max_task_seconds + 10s（runner F7）。
     managed_doc_apply_deadline: float = 600.0
+    # Must exceed Adapter apply deadline; includes in-flight completion + rollback.
+    managed_doc_cancel_rollback_deadline: float = 900.0
+    # Deployment truth: enable only when the configured Adapter exposes a
+    # durable shared operation-receipt store.
+    managed_doc_operation_idempotency: bool = False
     # EVO_MANAGED_DOC_PROTECTED_SECTIONS（JSON）：dict[doc_kind, list[ProtectedSectionConfig]]，
     # key 为精确 doc_kind。默认空（无受保护区段）。runner 映射为 adapter_client ProtectedSection。
     managed_doc_protected_sections: dict[str, list[ProtectedSectionConfig]] = Field(
@@ -148,6 +157,14 @@ class EvolveConfig(BaseSettings):
                 )
         else:
             object.__setattr__(self, "llm_provider", provider)
+        return self
+
+    @model_validator(mode="after")
+    def _validate_managed_doc_deadlines(self) -> Self:
+        if self.managed_doc_cancel_rollback_deadline <= self.managed_doc_apply_deadline:
+            raise ValueError(
+                "managed_doc_cancel_rollback_deadline must exceed managed_doc_apply_deadline"
+            )
         return self
 
     @staticmethod

@@ -9,7 +9,14 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from evo_agent.types import OptimizeReport, SkillContentSnapshot, SkillScore, TrainResult, ValResult
+from evo_agent.types import (
+    ManagedDocEpochContent,
+    OptimizeReport,
+    SkillContentSnapshot,
+    SkillScore,
+    TrainResult,
+    ValResult,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +59,7 @@ class ReportFormatter:
         managed_doc_kind: str | None = None,
         managed_doc_content_before: str | None = None,
         managed_doc_content_after: str | None = None,
+        managed_doc_epoch_contents: tuple[ManagedDocEpochContent, ...] = (),
         managed_doc_task_ids: tuple[str, ...] = (),
         managed_doc_records: tuple[Any, ...] = (),
     ) -> None:
@@ -69,6 +77,7 @@ class ReportFormatter:
         self._managed_doc_kind = managed_doc_kind
         self._managed_doc_content_before = managed_doc_content_before
         self._managed_doc_content_after = managed_doc_content_after
+        self._managed_doc_epoch_contents = managed_doc_epoch_contents
         self._managed_doc_task_ids = managed_doc_task_ids
         self._managed_doc_records = managed_doc_records
 
@@ -98,6 +107,7 @@ class ReportFormatter:
             "managed_doc_kind": self._managed_doc_kind,
             "managed_doc_content_before": self._managed_doc_content_before,
             "managed_doc_content_after": managed_doc_after,
+            "managed_doc_epoch_contents": self._managed_doc_epoch_contents,
             "managed_doc_task_ids": self._managed_doc_task_ids,
         }
 

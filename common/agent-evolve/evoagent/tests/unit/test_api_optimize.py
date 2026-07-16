@@ -10,9 +10,10 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from evo_agent.api.app import app
-from evo_agent.api.jobs import JobStatus, job_manager
+from evo_agent.api.jobs import JobManager, JobStatus, job_manager
+from evo_agent.api.routes import optimize as optimize_routes
 from evo_agent.config import EvolveConfig
-from evo_agent.types import OptimizeReport, TrainResult, ValResult
+from evo_agent.types import ManagedDocEpochContent, OptimizeReport, TrainResult, ValResult
 
 
 @pytest.fixture
@@ -280,7 +281,7 @@ async def test_result_edits_applied_uses_counter_not_report(
             return_value=config_with_adapter,
         ),
         patch(
-            "evo_agent.api.routes.optimize.run_optimization",
+            "evo_agent.api.routes.optimize.run_optimization_with_cancellation_recovery",
             new=AsyncMock(return_value=over_counted_report),
         ),
     ):
@@ -348,7 +349,7 @@ async def test_result_val_includes_card_fields(
             return_value=config_with_adapter,
         ),
         patch(
-            "evo_agent.api.routes.optimize.run_optimization",
+            "evo_agent.api.routes.optimize.run_optimization_with_cancellation_recovery",
             new=AsyncMock(return_value=report),
         ),
     ):
@@ -406,7 +407,7 @@ async def test_result_val_card_fields_none_for_old_report(
             return_value=config_with_adapter,
         ),
         patch(
-            "evo_agent.api.routes.optimize.run_optimization",
+            "evo_agent.api.routes.optimize.run_optimization_with_cancellation_recovery",
             new=AsyncMock(return_value=report),
         ),
     ):
@@ -463,10 +464,12 @@ def _make_managed_doc_api_request(*, tmp_path: Path, scenario_name: str = "edp_a
     return {
         "task_name": "test-task",
         "agent_name": "test_agent",
-        "optimizer_type": "skill",
+        "optimizer_type": "prompt",
         "dataset_path": str(data_file),
         "skills": [],
         "managed_doc_kind": "agent_rule",
+        "client_task_id": f"studio-{tmp_path.parent.name}-{tmp_path.name}",
+        "managed_doc_expected_revision": "rev-1",
         "optimizer_template": {
             "name": scenario_name,
             "scenario": scenario_name,
@@ -495,7 +498,7 @@ async def test_start_optimize_rejects_skills_and_managed_doc_kind_both_present(
     ):
         resp = await client.post("/optimize", json=body)
     assert resp.status_code == 422
-    assert "互斥" in resp.json()["detail"]
+    assert resp.json()["detail"]["code"] == "OPTIMIZATION_TARGET_INVALID"
 
 
 @pytest.mark.asyncio
@@ -511,7 +514,101 @@ async def test_start_optimize_rejects_both_skills_and_managed_doc_kind_absent(
     ):
         resp = await client.post("/optimize", json=body)
     assert resp.status_code == 422
-    assert "必须提供" in resp.json()["detail"]
+    assert resp.json()["detail"]["code"] == "OPTIMIZATION_TARGET_INVALID"
+
+
+@pytest.mark.asyncio
+async def test_prompt_submission_requires_client_task_id(
+    client: AsyncClient, tmp_path: Path, config_with_adapter: EvolveConfig
+) -> None:
+    body = _make_managed_doc_api_request(tmp_path=tmp_path)
+    body.pop("client_task_id")
+    jobs_before = len(job_manager.list_jobs())
+
+    with (
+        patch(
+            "evo_agent.api.routes.optimize.EvolveConfig.get",
+            return_value=config_with_adapter,
+        ),
+        patch(
+            "evo_agent.api.routes.optimize.run_optimization_with_cancellation_recovery",
+            new=AsyncMock(side_effect=AssertionError("invalid request started a job")),
+        ),
+    ):
+        response = await client.post("/optimize", json=body)
+
+    assert response.status_code == 422
+    assert len(job_manager.list_jobs()) == jobs_before
+
+
+@pytest.mark.asyncio
+async def test_prompt_submission_requires_expected_revision(
+    client: AsyncClient, tmp_path: Path, config_with_adapter: EvolveConfig
+) -> None:
+    body = _make_managed_doc_api_request(tmp_path=tmp_path)
+    body.pop("managed_doc_expected_revision")
+    jobs_before = len(job_manager.list_jobs())
+
+    with patch(
+        "evo_agent.api.routes.optimize.EvolveConfig.get",
+        return_value=config_with_adapter,
+    ):
+        response = await client.post("/optimize", json=body)
+
+    assert response.status_code == 422
+    assert len(job_manager.list_jobs()) == jobs_before
+
+
+@pytest.mark.asyncio
+async def test_prompt_submission_replay_returns_same_job_and_starts_once(
+    client: AsyncClient,
+    tmp_path: Path,
+    config_with_adapter: EvolveConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = JobManager(control_db_path=tmp_path / "control.db")
+    monkeypatch.setattr(optimize_routes, "job_manager", manager)
+    body = _make_managed_doc_api_request(tmp_path=tmp_path)
+    body.update(
+        optimizer_type="prompt",
+        client_task_id="studio-task-replay",
+        managed_doc_expected_revision="rev-1",
+    )
+    report = OptimizeReport(
+        skills=("managed_doc:agent_rule",),
+        dataset="dataset",
+        epochs_completed=0,
+        edits_applied=0,
+        train=TrainResult(0.0, 0.0, "+0%", 0.0, 0.0, 0),
+        val=ValResult(0.0, 0.0, (), 0),
+        gate_results=(),
+        artifact_dir=tmp_path,
+        managed_doc_kind="agent_rule",
+        managed_doc_content_before="# baseline",
+        managed_doc_content_after="# baseline",
+    )
+    run_mock = AsyncMock(return_value=report)
+
+    with (
+        patch(
+            "evo_agent.api.routes.optimize.EvolveConfig.get",
+            return_value=config_with_adapter,
+        ),
+        patch(
+            "evo_agent.api.routes.optimize.run_optimization_with_cancellation_recovery",
+            new=run_mock,
+        ),
+    ):
+        first = await client.post("/optimize", json=body)
+        replay = await client.post("/optimize", json=body)
+        for job in manager.list_jobs():
+            if job.background_task is not None:
+                await job.background_task
+
+    assert first.status_code == 200
+    assert replay.status_code == 200
+    assert replay.json()["job_id"] == first.json()["job_id"]
+    assert run_mock.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -544,6 +641,9 @@ async def test_start_optimize_managed_doc_response_includes_before_after_task_id
         managed_doc_kind="agent_rule",
         managed_doc_content_before="# rule v1",
         managed_doc_content_after="# rule v2",
+        managed_doc_epoch_contents=(
+            ManagedDocEpochContent(round=1, content="# rejected candidate"),
+        ),
         managed_doc_task_ids=("task-1", "task-2"),
     )
     body = _make_managed_doc_api_request(tmp_path=tmp_path)
@@ -553,7 +653,7 @@ async def test_start_optimize_managed_doc_response_includes_before_after_task_id
             return_value=config_with_adapter,
         ),
         patch(
-            "evo_agent.api.routes.optimize.run_optimization",
+            "evo_agent.api.routes.optimize.run_optimization_with_cancellation_recovery",
             new=AsyncMock(return_value=md_report),
         ),
     ):
@@ -570,33 +670,36 @@ async def test_start_optimize_managed_doc_response_includes_before_after_task_id
     assert job.result["managed_doc_kind"] == "agent_rule"
     assert job.result["managed_doc_content_before"] == "# rule v1"
     assert job.result["managed_doc_content_after"] == "# rule v2"
+    assert job.result["managed_doc_epoch_contents"] == [
+        {"round": 1, "content": "# rejected candidate"}
+    ]
     assert job.result["managed_doc_task_ids"] == ["task-1", "task-2"]
 
 
 @pytest.mark.asyncio
-async def test_running_managed_doc_cancel_returns_409_and_keeps_running(
+async def test_running_managed_doc_cancel_returns_202_and_keeps_running(
     client: AsyncClient,
 ) -> None:
-    """RUNNING managed-doc job 禁止伪取消（不变量 1）：409 且 status 仍 RUNNING。"""
+    """RUNNING Prompt latches cancellation but remains active until rollback."""
 
     job = job_manager.submit({"task_name": "md-cancel-test"})
     job.managed_doc_kind = "agent_rule"
     job.status = JobStatus.RUNNING
     resp = await client.post(f"/optimize/{job.job_id}/cancel")
-    assert resp.status_code == 409
-    assert "managed-doc running job" in resp.json()["detail"]
-    # job 仍 RUNNING，未被标 CANCELLED
+    assert resp.status_code == 202
+    assert resp.json()["status"] == "running"
     assert job_manager.get(job.job_id).status == JobStatus.RUNNING
+    assert job.cancellation_token.is_requested
 
 
 @pytest.mark.asyncio
 async def test_queued_managed_doc_job_can_be_cancelled(client: AsyncClient) -> None:
-    """QUEUED 阶段（训练未开始）managed-doc job 仍可取消 → 200 + CANCELLED。"""
+    """QUEUED 阶段（训练未开始）managed-doc job 可接受取消并立即终态。"""
 
     job = job_manager.submit({"task_name": "md-queued-cancel-test"})
     job.managed_doc_kind = "agent_rule"
     # 保持 QUEUED（submit 默认状态）
     assert job.status == JobStatus.QUEUED
     resp = await client.post(f"/optimize/{job.job_id}/cancel")
-    assert resp.status_code == 200
+    assert resp.status_code == 202
     assert job_manager.get(job.job_id).status == JobStatus.CANCELLED

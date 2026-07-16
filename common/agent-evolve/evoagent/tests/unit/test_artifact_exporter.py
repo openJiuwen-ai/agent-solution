@@ -173,7 +173,7 @@ def test_export_trajectories_object_preserves_chinese(tmp_path: Path) -> None:
 
 
 def test_export_validation_publishes_manifest_then_success_marker(tmp_path: Path) -> None:
-    """胜出 batch 的结果、脱敏轨迹和 checksum 形成一个完整提交。"""
+    """胜出 batch 的结果、可读轨迹和 checksum 形成一个完整提交。"""
     exporter = ArtifactExporter(str(tmp_path), score_threshold=0.6)
     outcomes = []
     for index, score in enumerate((0.55, 0.8)):
@@ -219,7 +219,9 @@ def test_export_validation_publishes_manifest_then_success_marker(tmp_path: Path
         "trajectories.jsonl",
         "../gate_result.json",
     }
-    assert "CUSTOMER-CANARY" not in (validation / "trajectories.jsonl").read_text(encoding="utf-8")
+    trajectories_text = (validation / "trajectories.jsonl").read_text(encoding="utf-8")
+    assert "CUSTOMER-CANARY" in trajectories_text
+    assert "ARTIFACT_REDACTED" not in trajectories_text
     results = json.loads((validation / "results.json").read_text(encoding="utf-8"))
     assert results["selected_failure_rate"] == 0.5
     assert {row["case_id"] for row in results["results"]} == {

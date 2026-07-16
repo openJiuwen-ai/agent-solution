@@ -17,6 +17,7 @@ import pytest
 from evo_agent.adapter_client.client import AdapterClient, AdapterError
 from evo_agent.adapter_client.types import (
     AlreadyApplied,
+    ManagedDocOperationReceipt,
     ManagedDocSnapshot,
     TaskState,
     UpdateStarted,
@@ -200,6 +201,22 @@ class TestGetManagedDocSync:
 
 
 class TestStartManagedDocUpdateSync:
+    def test_operation_id_is_sent_for_durable_idempotency(self) -> None:
+        captured: dict[str, Any] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(202, json={"task_id": "task-rollback"})
+
+        client = _make_mock_client(httpx.MockTransport(handler))
+        client.start_managed_doc_update_sync(
+            "agent_rule",
+            "# baseline",
+            operation_id="evo-cancel:job-1",
+        )
+
+        assert captured["body"]["operation_id"] == "evo-cancel:job-1"
+
     def test_202_new_task_returns_update_started(self) -> None:
         """新任务 202 + task_id → UpdateStarted。"""
         captured: dict[str, Any] = {}
@@ -366,3 +383,47 @@ class TestGetManagedDocTaskSync:
         with pytest.raises(AdapterError) as exc:
             client.get_managed_doc_task_sync("task-1")
         assert exc.value.status_code == 200
+
+
+class TestGetManagedDocOperationSync:
+    def test_legal_200_returns_operation_receipt(self) -> None:
+        captured: dict[str, Any] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["path"] = request.url.path
+            return httpx.Response(
+                200,
+                json={
+                    "operation_id": "evo-cancel:job-1",
+                    "status": "RUNNING",
+                    "task_id": "task-1",
+                    "target_revision": "sha-1",
+                    "last_error": None,
+                },
+            )
+
+        client = _make_mock_client(httpx.MockTransport(handler))
+        receipt = client.get_managed_doc_operation_sync("evo-cancel:job-1")
+
+        assert isinstance(receipt, ManagedDocOperationReceipt)
+        assert receipt.status == "RUNNING"
+        assert receipt.task_id == "task-1"
+        assert captured["path"] == "/api/v1/managed-docs/operations/evo-cancel:job-1"
+
+    def test_missing_required_field_raises_adapter_error(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"status": "RUNNING"})
+
+        client = _make_mock_client(httpx.MockTransport(handler))
+        with pytest.raises(AdapterError) as exc:
+            client.get_managed_doc_operation_sync("evo-cancel:job-1")
+        assert exc.value.status_code == 200
+
+    def test_http_error_raises_adapter_error(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(503, json={"detail": "operation store unavailable"})
+
+        client = _make_mock_client(httpx.MockTransport(handler))
+        with pytest.raises(AdapterError) as exc:
+            client.get_managed_doc_operation_sync("evo-cancel:job-1")
+        assert exc.value.status_code == 503

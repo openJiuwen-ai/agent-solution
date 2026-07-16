@@ -34,6 +34,7 @@ from openjiuwen.core.common.logging import logger
 from openjiuwen.core.foundation.llm.schema.message import UserMessage
 
 from evo_agent.adapter_client.operator import split_frontmatter
+from evo_agent.cancellation import CancellationRequestedError, CancellationToken
 from evo_agent.evaluator.batch_result import (
     EvaluationBatchResult,
     EvaluationFailure,
@@ -286,6 +287,7 @@ class SkillDocumentOptimizer(BaseOptimizer):  # type: ignore[misc]
         preserve_frontmatter: bool = True,
         artifact_dir: str | None = None,
         artifact_export_trajectories: bool = True,
+        cancellation_token: CancellationToken | None = None,
     ):
         super().__init__()
 
@@ -329,6 +331,7 @@ class SkillDocumentOptimizer(BaseOptimizer):  # type: ignore[misc]
             chars_per_token=2.0,
         )
         self._model = model
+        self._cancellation_token = cancellation_token or CancellationToken()
 
         # Hyperparameters
         self._batch_size = batch_size
@@ -396,6 +399,12 @@ class SkillDocumentOptimizer(BaseOptimizer):  # type: ignore[misc]
         )
         self._artifact_epoch = -1
         self._last_training_batch: EvaluationBatchResult | None = None
+
+    def _raise_if_cancellation_requested(self) -> None:
+        """Honor cancellation while tolerating legacy ``__new__`` test fixtures."""
+        token = getattr(self, "_cancellation_token", None)
+        if token is not None:
+            token.raise_if_requested()
 
     @staticmethod
     def requires_forward_data() -> bool:
@@ -483,6 +492,7 @@ class SkillDocumentOptimizer(BaseOptimizer):  # type: ignore[misc]
 
         async def run_one(case: Case, sem: asyncio.Semaphore) -> tuple[dict[str, Any], Any]:
             async with sem:
+                self._raise_if_cancellation_requested()
                 session = create_agent_session()
                 try:
                     res = await self._agent.invoke(
@@ -496,6 +506,7 @@ class SkillDocumentOptimizer(BaseOptimizer):  # type: ignore[misc]
                         exc,
                     )
                     res = {"error": str(exc)}
+                self._raise_if_cancellation_requested()
                 return res, session
 
         sem = asyncio.Semaphore(
@@ -574,6 +585,7 @@ class SkillDocumentOptimizer(BaseOptimizer):  # type: ignore[misc]
         valid_op_ids = set(self._operators)
 
         async def _reflect_one(op_id: str) -> tuple[str, list[RawPatch]]:
+            self._raise_if_cancellation_requested()
             attr_batch = attributed.get(op_id)
             if attr_batch is not None:
                 op_batch_data = list(attr_batch.failures) + list(attr_batch.successes)
@@ -588,6 +600,7 @@ class SkillDocumentOptimizer(BaseOptimizer):  # type: ignore[misc]
                 batch_data=op_batch_data if op_batch_data else None,
                 operator_id=op_id,
             )
+            self._raise_if_cancellation_requested()
             logger.info(
                 "[timing] train.reflect epoch=%d step=%d accumulation=%d "
                 "operator=%s samples=%d patches=%d elapsed=%.3fs",
@@ -630,11 +643,13 @@ class SkillDocumentOptimizer(BaseOptimizer):  # type: ignore[misc]
         multi = len(self._operators) > 1
 
         async def _one(op_id: str, patches: list[RawPatch]) -> tuple[str, Patch, list[Edit]]:
+            self._raise_if_cancellation_requested()
             skill_content = self._current_skill_by_operator.get(op_id, "")
             aggregate_started = time.perf_counter()
             merged = await self._aggregate(
                 patches=patches, skill_content=self._llm_skill_view(skill_content)
             )
+            self._raise_if_cancellation_requested()
             logger.info(
                 "[timing] train.aggregate epoch=%d step=%d operator=%s patches=%d "
                 "edits=%d elapsed=%.3fs",
@@ -651,6 +666,7 @@ class SkillDocumentOptimizer(BaseOptimizer):  # type: ignore[misc]
                 budget=budget,
                 skill_content=self._llm_skill_view(skill_content),
             )
+            self._raise_if_cancellation_requested()
             logger.info(
                 "[timing] train.select epoch=%d step=%d operator=%s edits=%d "
                 "selected=%d budget=%d elapsed=%.3fs",
@@ -681,6 +697,7 @@ class SkillDocumentOptimizer(BaseOptimizer):  # type: ignore[misc]
             )
 
             if ranked.edits:
+                self._raise_if_cancellation_requested()
                 apply_started = time.perf_counter()
                 updated_skill, _ = apply_patch_with_report(skill_content, ranked)
                 self._current_skill_by_operator[op_id] = updated_skill
@@ -1669,6 +1686,7 @@ class SkillDocumentOptimizer(BaseOptimizer):  # type: ignore[misc]
         failures/successes per operator, and runs reflect/aggregate/select/apply
         independently for each operator.
         """
+        self._raise_if_cancellation_requested()
         # Read current skills from ALL bound operators
         self._artifact_epoch += 1
         artifact_epoch = self._artifact_epoch
@@ -1692,6 +1710,7 @@ class SkillDocumentOptimizer(BaseOptimizer):  # type: ignore[misc]
         )
 
         for step in range(self._steps_per_epoch):
+            self._raise_if_cancellation_requested()
             self._global_step += 1
             patches_by_operator: dict[str, list[RawPatch]] = {
                 op_id: [] for op_id in self._operators
@@ -1706,6 +1725,7 @@ class SkillDocumentOptimizer(BaseOptimizer):  # type: ignore[misc]
             # Accumulation loop
             for a in range(self._accumulation):
                 try:
+                    self._raise_if_cancellation_requested()
                     batch_cases = self._sample_cases(
                         self._batch_size,
                         seed=self._global_step * 100 + a,
@@ -1717,6 +1737,7 @@ class SkillDocumentOptimizer(BaseOptimizer):  # type: ignore[misc]
                     batch_evaluated, rollout_trajectories = await self._rollout(
                         cases=batch_cases,
                     )
+                    self._raise_if_cancellation_requested()
                     if self._last_training_batch is not None:
                         step_evaluation_outcomes.extend(self._last_training_batch.outcomes)
                     logger.info(
@@ -1767,6 +1788,7 @@ class SkillDocumentOptimizer(BaseOptimizer):  # type: ignore[misc]
                         success_batch=success_batch,
                         skill_contents=self._current_skill_by_operator,
                     )
+                    self._raise_if_cancellation_requested()
                     logger.info(
                         "[timing] train.attribute epoch=%d step=%d accumulation=%d "
                         "operators=%d elapsed=%.3fs",
@@ -1781,6 +1803,7 @@ class SkillDocumentOptimizer(BaseOptimizer):  # type: ignore[misc]
                     round_patches = await self._reflect_all_operators(
                         attributed, step=step, accumulation=a
                     )
+                    self._raise_if_cancellation_requested()
                     for op_id, valid_patches in round_patches.items():
                         patches_by_operator[op_id].extend(valid_patches)
 
@@ -1794,6 +1817,8 @@ class SkillDocumentOptimizer(BaseOptimizer):  # type: ignore[misc]
                                     "curr_reason": eval_case.reason,
                                 }
                             )
+                except CancellationRequestedError:
+                    raise
                 except Exception as exc:
                     logger.warning(
                         "[skill_doc_opt] accumulation round %d/%d in step %d failed: %s",
@@ -1832,6 +1857,7 @@ class SkillDocumentOptimizer(BaseOptimizer):  # type: ignore[misc]
             # 5. Per-operator aggregate → select → apply — cross-operator
             #    concurrent (C4 / #19). 单 operator 输出与顺序一致。
             budget = self._scheduler.step()
+            self._raise_if_cancellation_requested()
             (
                 n_merged_edits_by_operator,
                 n_selected_edits_by_operator,

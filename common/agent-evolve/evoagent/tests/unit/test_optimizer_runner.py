@@ -27,9 +27,16 @@ import pytest
 
 from evo_agent.adapter_client.client import AdapterClient, AdapterError
 from evo_agent.adapter_client.types import ManagedDocSnapshot
+from evo_agent.cancellation import CancellationRequestedError, CancellationToken
 from evo_agent.config import EvolveConfig
 from evo_agent.optimizer_runner import _build_operators, run_optimization
-from evo_agent.types import OptimizeReport, OptimizeRequest, TrainResult, ValResult
+from evo_agent.types import (
+    ManagedDocEpochContent,
+    OptimizeReport,
+    OptimizeRequest,
+    TrainResult,
+    ValResult,
+)
 
 # ── Helpers ──
 
@@ -41,6 +48,7 @@ def _make_request(
     agent_name: str = "test_agent",
     num_epochs: int = 2,
     managed_doc_kind: str | None = None,
+    managed_doc_expected_revision: str | None = None,
 ) -> OptimizeRequest:
     return OptimizeRequest(
         scenario="edp_agent",
@@ -50,6 +58,7 @@ def _make_request(
         agent_name=agent_name,
         num_epochs=num_epochs,
         managed_doc_kind=managed_doc_kind,
+        managed_doc_expected_revision=managed_doc_expected_revision,
     )
 
 
@@ -237,6 +246,19 @@ def make_harness():
 
 
 # ── _build_operators ──
+
+
+async def test_runner_stops_at_safe_point_when_cancellation_was_requested(
+    make_harness: Callable[[], SimpleNamespace],
+) -> None:
+    h = make_harness()
+    token = CancellationToken()
+    token.request()
+
+    with pytest.raises(CancellationRequestedError):
+        await h.run(cancellation_token=token)
+
+    h.ac_cls.assert_not_called()
 
 
 async def test_build_operators_fetches_content() -> None:
@@ -655,14 +677,21 @@ async def test_baseline_eval_call_count_no_callback_le_callback(
     assert no_cb_eval_calls <= cb_eval_calls
 
 
-def test_run_optimization_signature_unchanged() -> None:
-    """run_optimization() 签名包含 phase_callback。"""
+def test_run_optimization_signature_exposes_cooperative_cancellation_context() -> None:
+    """runner 接收 token 与只写 baseline observer，旧 callback 参数保持兼容。"""
     sig = inspect.signature(run_optimization)
     params = list(sig.parameters.keys())
-    assert params == ["request", "config", "progress_callback", "phase_callback"]
-    # progress_callback and phase_callback are keyword-only
+    assert params == [
+        "request",
+        "config",
+        "progress_callback",
+        "phase_callback",
+        "cancellation_token",
+        "managed_doc_baseline_callback",
+    ]
     assert sig.parameters["progress_callback"].kind == inspect.Parameter.KEYWORD_ONLY
     assert sig.parameters["phase_callback"].kind == inspect.Parameter.KEYWORD_ONLY
+    assert sig.parameters["cancellation_token"].kind == inspect.Parameter.KEYWORD_ONLY
 
 
 # ── W10.7: phase_callback injection ──
@@ -1191,6 +1220,29 @@ async def test_runner_managed_doc_canonical_id_used_as_operators_key_and_artifac
     assert h.trainer_cls.call_args.kwargs["skill_names"] == ["managed_doc:agent_rule"]
 
 
+async def test_runner_passes_captured_managed_doc_candidates_to_report(
+    tmp_path: Path,
+    make_harness: Callable[[], SimpleNamespace],
+) -> None:
+    h = _md_harness_with_snapshot(make_harness, _make_valid_snapshot())
+    h.trainer.managed_doc_epoch_contents.return_value = (
+        "# candidate 1",
+        "# rejected candidate 2",
+    )
+    h.trainer.gate_epoch_scores = [
+        {"base_score": 0.1, "candidate_score": 0.2},
+        {"base_score": 0.2, "candidate_score": 0.15},
+    ]
+
+    await h.run(_make_request(managed_doc_kind="agent_rule"), _make_config(tmp_path))
+
+    assert h.rf_cls.call_args.kwargs["managed_doc_epoch_contents"] == (
+        ManagedDocEpochContent(round=1, content="# candidate 1"),
+        ManagedDocEpochContent(round=2, content="# rejected candidate 2"),
+    )
+    assert h.rf_cls.call_args.kwargs["val_per_epoch_scores"] == (0.2, 0.15)
+
+
 async def test_runner_managed_doc_same_kind_two_runs_isolate_artifact_dirs(
     tmp_path: Path,
     make_harness: Callable[[], SimpleNamespace],
@@ -1266,6 +1318,55 @@ async def test_runner_job_start_accepts_only_fully_applied_snapshot_no_global_re
     # baseline 内容固化为 managed_doc_before.md
     before = _managed_doc_run_dir(tmp_path) / "managed_doc_before.md"
     assert before.read_text(encoding="utf-8") == snap.content
+
+
+async def test_runner_rejects_changed_expected_revision_before_first_candidate_apply(
+    tmp_path: Path,
+    make_harness: Callable[[], SimpleNamespace],
+) -> None:
+    from evo_agent.errors import ManagedDocBaselineChangedError
+
+    job_start = _make_valid_snapshot(file_revision="rev-1", applied_revision="rev-1")
+    changed = _make_valid_snapshot(file_revision="rev-2", applied_revision="rev-2")
+    h = _md_harness_with_snapshot(make_harness, job_start)
+    h.adapter.get_managed_doc_sync = MagicMock(side_effect=[job_start, changed])
+
+    with pytest.raises(ManagedDocBaselineChangedError) as exc_info:
+        await h.run(
+            _make_request(
+                managed_doc_kind="agent_rule",
+                managed_doc_expected_revision="rev-1",
+            ),
+            _make_config(tmp_path),
+        )
+
+    assert exc_info.value.code == "MANAGED_DOC_BASELINE_CHANGED"
+    h.trainer.train.assert_not_called()
+
+
+async def test_runner_does_not_publish_unverified_job_start_baseline(
+    tmp_path: Path,
+    make_harness: Callable[[], SimpleNamespace],
+) -> None:
+    from evo_agent.errors import ManagedDocBaselineChangedError
+
+    unexpected = _make_valid_snapshot(file_revision="rev-2", applied_revision="rev-2")
+    h = _md_harness_with_snapshot(make_harness, unexpected)
+    observer = MagicMock()
+
+    with pytest.raises(ManagedDocBaselineChangedError):
+        await h.run(
+            _make_request(
+                managed_doc_kind="agent_rule",
+                managed_doc_expected_revision="rev-1",
+            ),
+            _make_config(tmp_path),
+            managed_doc_baseline_callback=observer,
+        )
+
+    observer.assert_not_called()
+    h.trainer.evaluate.assert_not_called()
+    h.trainer.train.assert_not_called()
 
 
 async def test_runner_job_start_rejects_pending_apply_before_rollout(

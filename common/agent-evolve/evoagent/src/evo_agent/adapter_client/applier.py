@@ -11,15 +11,18 @@ import hashlib
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 
 import httpx
 
 from evo_agent.adapter_client.client import AdapterClient, AdapterError
 from evo_agent.adapter_client.types import (
     AlreadyApplied,
+    ManagedDocOperationReceipt,
     ManagedDocSnapshot,
     TaskState,
 )
+from evo_agent.cancellation import CancellationToken
 from evo_agent.errors import ManagedDocApplyError
 
 
@@ -75,6 +78,9 @@ class ManagedDocApplier:
         deadline: float = 600.0,
         clock: Callable[[], float] = time.monotonic,
         sleeper: Callable[[float], None] = time.sleep,
+        operation_id: str | None = None,
+        cancellation_token: CancellationToken | None = None,
+        phase_callback: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> None:
         self._client = adapter_client
         self._doc_kind = doc_kind
@@ -83,6 +89,10 @@ class ManagedDocApplier:
         self._deadline = deadline
         self._clock = clock
         self._sleeper = sleeper
+        self._operation_id = operation_id
+        self._cancellation_token = cancellation_token
+        self._phase_callback = phase_callback
+        self._cancel_waiting_emitted = False
         self._records: list[ManagedDocApplyRecord] = []
 
     @property
@@ -196,11 +206,20 @@ class ManagedDocApplier:
         post_start = self._clock()
         post_timeout = self._remaining(start)
         try:
+            post_kwargs: dict[str, Any] = {"request_timeout": post_timeout}
+            if self._operation_id is not None:
+                post_kwargs["operation_id"] = self._operation_id
             post_result = self._client.start_managed_doc_update_sync(
-                self._doc_kind, content, request_timeout=post_timeout
+                self._doc_kind, content, **post_kwargs
             )
         except httpx.TransportError as e:
             post_time = self._clock() - post_start
+            if self._operation_id is not None:
+                return self._recover_operation_after_response_loss(
+                    content_hash=content_hash,
+                    start=start,
+                    post_time=post_time,
+                )
             total = self._clock() - start
             raise self._fail(
                 phase="failed_post",
@@ -241,6 +260,68 @@ class ManagedDocApplier:
             task_id=post_result.task_id,
             start=start,
             post_time=post_time,
+        )
+
+    def _recover_operation_after_response_loss(
+        self,
+        *,
+        content_hash: str,
+        start: float,
+        post_time: float,
+    ) -> AppliedDocument:
+        """Consult the durable receipt; never retry an uncertain update POST."""
+        assert self._operation_id is not None
+        try:
+            receipt: ManagedDocOperationReceipt = self._client.get_managed_doc_operation_sync(
+                self._operation_id,
+                request_timeout=self._remaining(start),
+            )
+        except (httpx.TransportError, AdapterError) as exc:
+            raise self._fail(
+                phase="failed_operation_receipt",
+                content_hash=content_hash,
+                task_id=None,
+                status=None,
+                adapter_error=f"operation receipt unavailable: {exc}",
+                post_time=post_time,
+                poll_time=0.0,
+                total_time=self._clock() - start,
+            ) from exc
+        if receipt.target_revision not in (None, content_hash):
+            raise self._fail(
+                phase="failed_operation_receipt",
+                content_hash=content_hash,
+                task_id=receipt.task_id,
+                status=receipt.status,
+                adapter_error="operation target revision does not match request",
+                post_time=post_time,
+                poll_time=0.0,
+                total_time=self._clock() - start,
+            )
+        if receipt.status in ("RECEIVED", "RUNNING") and receipt.task_id is not None:
+            return self._poll_until_terminal(
+                content_hash=content_hash,
+                task_id=receipt.task_id,
+                start=start,
+                post_time=post_time,
+            )
+        if receipt.status == "SUCCEEDED":
+            return self._handle_task_not_found(
+                content_hash=content_hash,
+                task_id=receipt.task_id or "",
+                start=start,
+                post_time=post_time,
+                poll_time=0.0,
+            )
+        raise self._fail(
+            phase="failed_operation_receipt",
+            content_hash=content_hash,
+            task_id=receipt.task_id,
+            status=receipt.status,
+            adapter_error=f"operation receipt terminal/ambiguous: {receipt.status}",
+            post_time=post_time,
+            poll_time=0.0,
+            total_time=self._clock() - start,
         )
 
     def _handle_already_applied(
@@ -328,6 +409,21 @@ class ManagedDocApplier:
         """轮询 task 至终态。PENDING/RUNNING 继续；GET 临时错误继续轮询。"""
         poll_time = 0.0
         while True:
+            if (
+                self._cancellation_token is not None
+                and self._cancellation_token.is_requested
+                and not self._cancel_waiting_emitted
+            ):
+                self._cancel_waiting_emitted = True
+                if self._phase_callback is not None:
+                    self._phase_callback(
+                        "log",
+                        {
+                            "level": "info",
+                            "message": "Waiting for in-flight managed-doc apply",
+                            "phase": "cancel_waiting_inflight",
+                        },
+                    )
             remaining = self._remaining(start)
             if remaining <= 0:
                 total = self._clock() - start

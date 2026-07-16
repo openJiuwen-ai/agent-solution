@@ -354,6 +354,19 @@ def test_resolve_passes_managed_doc_kind(tmp_path: Path, scenarios_dir: Path) ->
     assert resolved.managed_doc_kind == "agent_rule"
 
 
+def test_resolve_passes_managed_doc_expected_revision(tmp_path: Path, scenarios_dir: Path) -> None:
+    resolved = _resolver(tmp_path, scenarios_dir).resolve(
+        OptimizeRequest(
+            scenario="edp_agent",
+            agent_name="agent",
+            managed_doc_kind="agent_rule",
+            managed_doc_expected_revision="rev-studio-baseline",
+        )
+    )
+
+    assert resolved.managed_doc_expected_revision == "rev-studio-baseline"
+
+
 def test_resolve_managed_doc_kind_default_none(tmp_path: Path, scenarios_dir: Path) -> None:
     """不传 managed_doc_kind 时 resolved.managed_doc_kind 为 None（Skill 路径）。"""
     resolved = _resolver(tmp_path, scenarios_dir).resolve(

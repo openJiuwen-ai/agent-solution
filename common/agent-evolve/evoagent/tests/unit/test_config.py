@@ -213,8 +213,17 @@ class TestEvolveConfig:
     def test_managed_doc_apply_deadline_from_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """EVO_MANAGED_DOC_APPLY_DEADLINE 环境变量注入。"""
         monkeypatch.setenv("EVO_MANAGED_DOC_APPLY_DEADLINE", "1200.0")
+        monkeypatch.setenv("EVO_MANAGED_DOC_CANCEL_ROLLBACK_DEADLINE", "1500.0")
         config = EvolveConfig()
         assert config.managed_doc_apply_deadline == 1200.0
+
+    def test_cancel_rollback_deadline_must_exceed_apply_deadline(self) -> None:
+        with pytest.raises(ValueError, match="cancel_rollback_deadline"):
+            EvolveConfig(
+                _env_file=None,
+                managed_doc_apply_deadline=120.0,
+                managed_doc_cancel_rollback_deadline=120.0,
+            )
 
     def test_managed_doc_protected_sections_default_empty(
         self, monkeypatch: pytest.MonkeyPatch

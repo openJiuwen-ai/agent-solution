@@ -17,6 +17,7 @@ from typing import Any, Literal
 from openjiuwen.agent_evolving.dataset import CaseLoader, EvaluatedCase
 from openjiuwen.agent_evolving.trainer.trainer import Trainer
 
+from evo_agent.cancellation import CancellationToken
 from evo_agent.dataset.case import merge_extra_data
 from evo_agent.errors import ValidationCoverageError
 from evo_agent.evaluator.batch_result import EvaluationBatchResult, EvaluationOutcome
@@ -74,6 +75,7 @@ class EvoTrainer(Trainer):  # type: ignore[misc]
         validation_max_case_attempts: int = 2,
         validation_min_success_ratio: float = 1.0,
         validation_require_same_case_set: bool = True,
+        cancellation_token: CancellationToken | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -89,6 +91,7 @@ class EvoTrainer(Trainer):  # type: ignore[misc]
         self._validation_max_case_attempts = validation_max_case_attempts
         self._validation_min_success_ratio = validation_min_success_ratio
         self._validation_require_same_case_set = validation_require_same_case_set
+        self._cancellation_token = cancellation_token or CancellationToken()
 
         # Gate score capture: records {base_score, candidate_score} per epoch
         # where 2 candidates were evaluated. Index i → Trainer epoch i+1.
@@ -97,6 +100,7 @@ class EvoTrainer(Trainer):  # type: ignore[misc]
         self._cached_base_val_evaluated: list[EvaluatedCase] | None = None
         self._cached_base_batch: EvaluationBatchResult | None = None
         self._last_validation_batch: EvaluationBatchResult | None = None
+        self._managed_doc_candidates: dict[str, list[str]] = {}
 
     @property
     def gate_epoch_scores(self) -> list[dict[str, float]]:
@@ -106,6 +110,10 @@ class EvoTrainer(Trainer):  # type: ignore[misc]
         Only populated when exactly 2 candidates were evaluated (base + candidate).
         """
         return list(self._gate_epoch_scores)
+
+    def managed_doc_epoch_contents(self, operator_id: str) -> tuple[str, ...]:
+        """Return immutable candidate contents captured before validation."""
+        return tuple(self._managed_doc_candidates.get(operator_id, ()))
 
     def record_validation_baseline(
         self,
@@ -135,6 +143,7 @@ class EvoTrainer(Trainer):  # type: ignore[misc]
         other — this override records all scores in ``_gate_epoch_scores``.
         """
         if not candidates:
+            self._cancellation_token.raise_if_requested()
             return self.evaluate(agent, val_cases)
 
         base_state = self._snapshot_operators_state(operators)
@@ -149,8 +158,21 @@ class EvoTrainer(Trainer):  # type: ignore[misc]
         states_by_candidate: list[dict[str, dict[str, Any]]] = []
         batches_by_candidate: list[EvaluationBatchResult] = []
         for candidate_index, cand_updates in enumerate(candidates):
+            self._cancellation_token.raise_if_requested()
             self._restore_operators_state(operators, base_state)
             self.apply_updates(operators, cand_updates or {})
+            self._cancellation_token.raise_if_requested()
+            # Capture exactly one evaluated state per epoch: the optimized
+            # candidate for [base, candidate], or the unchanged state when the
+            # optimizer produced only one candidate. Capture happens before
+            # validation can restore a winner, preserving rejected rounds.
+            if candidate_index == len(candidates) - 1:
+                for operator_id, operator in operators.items():
+                    if not operator_id.startswith("managed_doc:"):
+                        continue
+                    content = operator.get_state().get("skill_content")
+                    if isinstance(content, str):
+                        self._managed_doc_candidates.setdefault(operator_id, []).append(content)
 
             cached_base_score = self._cached_base_val_score
             cached_base_evaluated = self._cached_base_val_evaluated
@@ -248,6 +270,7 @@ class EvoTrainer(Trainer):  # type: ignore[misc]
                 # Candidate is currently applied (last loop iteration left it
                 # in place); re-evaluate once without re-applying.
                 reval_started = time.perf_counter()
+                self._cancellation_token.raise_if_requested()
                 cand2_score, cand2_evaluated = self.evaluate(agent, val_cases)
                 logger.info(
                     "[timing] validation.candidate index=1 source=reval "
@@ -385,6 +408,7 @@ class EvoTrainer(Trainer):  # type: ignore[misc]
         Raises TrajectoryUnavailableError if no valid traces after max retries.
         """
         for attempt in range(self._trace_max_retries):
+            self._cancellation_token.raise_if_requested()
             trace_data: dict[str, Any] = await self._adapter_client.get_traces(
                 case_id=conversation_id,
             )
@@ -410,6 +434,7 @@ class EvoTrainer(Trainer):  # type: ignore[misc]
 
         async def _rollout_one(case: Any) -> tuple[dict[str, Any], Any]:
             async with sem:
+                self._cancellation_token.raise_if_requested()
                 conversation_id = self._conversation_id_factory.new(
                     phase="val", case_id=case.case_id
                 )
@@ -430,6 +455,10 @@ class EvoTrainer(Trainer):  # type: ignore[misc]
                     result = {"answer": "", "error": str(exc)}
 
                 answer = result if isinstance(result, dict) else {"answer": str(result)}
+
+                # Do not interrupt an already-started Agent call. Once it has
+                # reached a terminal response, stop before scheduling trace work.
+                self._cancellation_token.raise_if_requested()
 
                 # Fetch trace with retry — 容忍缺失，给空 trajectory
                 try:
@@ -482,12 +511,15 @@ class EvoTrainer(Trainer):  # type: ignore[misc]
         if cases is None or not cases.get_cases():
             return 0.0, []
 
+        self._cancellation_token.raise_if_requested()
+
         case_list = cases.get_cases()
         total_started = time.perf_counter()
 
         async def _run() -> tuple[float, list[EvaluatedCase]]:
             rollout_started = time.perf_counter()
             predicts, eval_cases = await self._predict_and_build_eval_cases(agent, case_list)
+            self._cancellation_token.raise_if_requested()
             rollout_elapsed = time.perf_counter() - rollout_started
             eval_started = time.perf_counter()
             detailed_evaluate = vars(self._evaluator).get("batch_evaluate_detailed")
@@ -566,6 +598,7 @@ class EvoTrainer(Trainer):  # type: ignore[misc]
         pending_indexes = list(range(len(eval_cases)))
         completed: dict[int, EvaluationOutcome] = {}
         for _attempt in range(self._validation_max_case_attempts):
+            self._cancellation_token.raise_if_requested()
             if not pending_indexes:
                 break
             attempt_cases = [eval_cases[index] for index in pending_indexes]

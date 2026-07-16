@@ -499,6 +499,41 @@ def test_select_best_candidate_picks_higher_score() -> None:
     assert evaluated == [base_eval]
 
 
+def test_managed_doc_candidate_content_is_captured_even_when_gate_rejects() -> None:
+    class Operator:
+        def __init__(self) -> None:
+            self.content = "baseline"
+
+        def get_state(self) -> dict[str, str]:
+            return {"skill_content": self.content}
+
+        def load_state(self, state: dict[str, str]) -> None:
+            self.content = state["skill_content"]
+
+        def set_parameter(self, target: str, value: str) -> None:
+            assert target == "skill_content"
+            self.content = value
+
+    trainer = _make_trainer()
+    base_eval = _make_evaluated_case("c1", 0.8)
+    rejected_eval = _make_evaluated_case("c1", 0.4)
+    trainer.evaluate = MagicMock(  # type: ignore[method-assign]
+        side_effect=[(0.8, [base_eval]), (0.4, [rejected_eval])]
+    )
+
+    trainer._select_best_candidate_on_val(
+        agent=MagicMock(),
+        operators={"managed_doc:agent_rule": Operator()},
+        candidates=[
+            {("managed_doc:agent_rule", "skill_content"): "baseline"},
+            {("managed_doc:agent_rule", "skill_content"): "rejected candidate"},
+        ],
+        val_cases=MagicMock(),
+    )
+
+    assert trainer.managed_doc_epoch_contents("managed_doc:agent_rule") == ("rejected candidate",)
+
+
 def test_select_best_candidate_single_candidate_no_record() -> None:
     """1 candidate → no entry in _gate_epoch_scores (no comparison to make)."""
     trainer = _make_trainer()

@@ -137,3 +137,41 @@ class ManagedDocBaselineError(FatalOptimizationError):
             f"managed-doc baseline failed: agent={agent_name} doc_kind={doc_kind} "
             f"reason={reason} diagnostics={diagnostics}"
         )
+
+
+class ManagedDocBaselineChangedError(FatalOptimizationError):
+    """The Adapter revision no longer matches Studio's durable baseline."""
+
+    code = "MANAGED_DOC_BASELINE_CHANGED"
+
+    def __init__(
+        self,
+        *,
+        agent_name: str,
+        doc_kind: str,
+        expected_revision: str,
+        file_revision: str | None,
+        applied_revision: str | None,
+        pending_apply: bool,
+    ) -> None:
+        self.agent_name = agent_name
+        self.doc_kind = doc_kind
+        self.expected_revision = expected_revision
+        self.file_revision = file_revision
+        self.applied_revision = applied_revision
+        self.pending_apply = pending_apply
+        super().__init__(
+            "managed-doc baseline changed: "
+            f"agent={agent_name} doc_kind={doc_kind} expected_revision={expected_revision} "
+            f"file_revision={file_revision} applied_revision={applied_revision} "
+            f"pending_apply={pending_apply}"
+        )
+
+
+class CancelRollbackError(FatalOptimizationError):
+    """A cancellation rollback failed or exceeded its deadline."""
+
+    def __init__(self, *, code: str, diagnostics: str) -> None:
+        self.code = code
+        self.diagnostics = diagnostics
+        super().__init__(f"cancel rollback failed: code={code} diagnostics={diagnostics}")

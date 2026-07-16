@@ -212,6 +212,8 @@ def build_managed_doc_operator(
     deadline: float = 600.0,
     poll_interval: float = 2.0,
     last_success_hash: str | None = None,
+    cancellation_token: Any | None = None,
+    phase_callback: Any | None = None,
 ) -> ManagedDocOperator:
     """创建 ManagedDocOperator（组合 Applier + ContentPolicy，不堆叠继承）。
 
@@ -235,6 +237,8 @@ def build_managed_doc_operator(
         last_success_hash=last_success_hash,
         poll_interval=poll_interval,
         deadline=deadline,
+        cancellation_token=cancellation_token,
+        phase_callback=phase_callback,
     )
     return ManagedDocOperator(
         skill_name=f"managed_doc:{doc_kind}",

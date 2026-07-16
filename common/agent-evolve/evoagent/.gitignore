@@ -33,11 +33,17 @@ workspace/
 # OS
 .DS_Store
 
-# docs/ — 只跟踪 rules/、develop/、api/ 和 ROADMAP.md
+# docs/ — 只跟踪 rules/、develop/、api/、ROADMAP.md 和指定跨仓设计文档
 docs/*
 !docs/rules/
 !docs/develop/
 !docs/api/
+!docs/adr/
+docs/adr/*
+!docs/adr/0012-studio-prompt-managed-doc-control-plane.md
+!docs/spec/
+docs/spec/*
+!docs/spec/studio-prompt-managed-doc-optimization.md
 !docs/ROADMAP.md
 
 # 构建期预下载的依赖 wheel（build 时生成，勿提交）

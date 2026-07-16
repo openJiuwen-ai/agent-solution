@@ -17,6 +17,7 @@ import httpx
 
 from evo_agent.adapter_client.types import (
     AlreadyApplied,
+    ManagedDocOperationReceipt,
     ManagedDocSnapshot,
     ManagedDocUpdateResult,
     TaskState,
@@ -280,6 +281,7 @@ class AdapterClient:
         content: str,
         *,
         request_timeout: float | None = None,
+        operation_id: str | None = None,
     ) -> ManagedDocUpdateResult:
         """POST /api/v1/managed-docs  action=update → UpdateStarted(202) | AlreadyApplied(200)。
 
@@ -293,6 +295,8 @@ class AdapterClient:
             "action": "update",
             "content": content,
         }
+        if operation_id is not None:
+            body["operation_id"] = operation_id
         response = self._sync_http.post(
             "/api/v1/managed-docs", json=body, timeout=self._sync_timeout(request_timeout)
         )
@@ -341,6 +345,32 @@ class AdapterClient:
                 f"missing field in managed-doc task state: {e}",
                 status_code=response.status_code,
             ) from e
+
+    def get_managed_doc_operation_sync(
+        self,
+        operation_id: str,
+        *,
+        request_timeout: float | None = None,
+    ) -> ManagedDocOperationReceipt:
+        """Query the Adapter's durable update receipt after an uncertain response."""
+        response = self._sync_http.get(
+            f"/api/v1/managed-docs/operations/{operation_id}",
+            timeout=self._sync_timeout(request_timeout),
+        )
+        data = self._handle_response(response)
+        try:
+            return ManagedDocOperationReceipt(
+                operation_id=data["operation_id"],
+                status=data["status"],
+                task_id=data.get("task_id"),
+                target_revision=data.get("target_revision"),
+                last_error=data.get("last_error"),
+            )
+        except (ValueError, KeyError, TypeError) as exc:
+            raise AdapterError(
+                f"missing field in managed-doc operation receipt: {exc}",
+                status_code=response.status_code,
+            ) from exc
 
     async def skill_list(self) -> list[dict[str, Any]]:
         """POST /api/v1/skills  action=skill_list

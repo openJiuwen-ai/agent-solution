@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 
 @dataclass(frozen=True)
@@ -20,6 +20,14 @@ class SkillContentSnapshot:
     name: str
     content_before: str
     epoch_contents: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ManagedDocEpochContent:
+    """The exact managed-document candidate evaluated for one round."""
+
+    round: int
+    content: str
 
 
 @dataclass(frozen=True)
@@ -59,12 +67,13 @@ class OptimizeRequest:
 
     # ── Skill ──
     skills: list[str] = field(default_factory=list)
-    optimizer_type: str = "skill"
+    optimizer_type: Literal["skill", "prompt", "tool"] = "skill"
 
     # ── managed-doc ──
     # 单文档优化模式：精确 doc_kind（adapter 按配置值精确匹配，构造时 strip，
     # 空白视为未提供）。与 ``skills`` 互斥（XOR）：二者必须且只能提供一种。
     managed_doc_kind: str | None = None
+    managed_doc_expected_revision: str | None = None
 
     # ── 数据集（双轨：API 用 dataset_path，CLI 用 dataset_manifest_path）──
     dataset_path: str = ""  # 原始数据文件路径（API 模式）
@@ -188,6 +197,7 @@ class OptimizeReport:
     managed_doc_kind: str | None = None
     managed_doc_content_before: str | None = None
     managed_doc_content_after: str | None = None
+    managed_doc_epoch_contents: tuple[ManagedDocEpochContent, ...] = ()
     managed_doc_task_ids: tuple[str, ...] = ()
 
 

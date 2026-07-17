@@ -110,6 +110,7 @@ HOME=/home/evolution/build EVOAGENT_SOLUTION_REPO=https://gitcode.com/AE-TEAM/ag
 | `EVOAGENT_IMAGE_TAG` | `evoagent:latest` | 构建出的镜像 tag |
 | `EVOAGENT_SOLUTION_REPO` | `https://gitcode.com/openJiuwen/agent-solution.git` | agent-solution 仓库地址 |
 | `EVOAGENT_SOLUTION_BRANCH` | `common` | 仓库分支 |
+| `EVOAGENT_SOLUTION_DIR` | `$HOME/EvoAgent/agent-solution` | 代码本地存放目录（也可用首个位置参数覆盖） |
 | `EVOAGENT_CORE_REPO` | `https://gitcode.com/openJiuwen/agent-core.git` | 源码构建模式使用的 agent-core 仓库 |
 | `EVOAGENT_CORE_BRANCH` | `main` | agent-core 分支（独立于 solution 分支） |
 | `EVOAGENT_CORE_VERSION` | `0.1.13` | `--local` 模式下 PyPI 版本号 |

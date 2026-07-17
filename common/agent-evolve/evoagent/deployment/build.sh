@@ -12,7 +12,7 @@
 # 使用：
 #   ./build.sh                                          # 默认路径，从源码构建 wheel
 #   ./build.sh --local                                  # local 模式，从 PyPI 下载 wheel
-#   ./build.sh /custom/path/agent-solution                  # 指定 agent-solution 路径
+#   ./build.sh /custom/path/agent-solution              # 指定 agent-solution 路径
 #   EVOAGENT_IMAGE_TAG=evoagent:v1.0.0 ./build.sh       # 自定义镜像 tag
 #   ./build.sh --skip-pull                              # 跳过代码拉取，使用本地代码构建
 #   ./build.sh --local --skip-pull                      # local 模式 + 跳过代码拉取
@@ -23,8 +23,9 @@
 #
 # 环境变量：
 #   EVOAGENT_IMAGE_TAG      镜像标签（默认 evoagent:latest）
-#   EVOAGENT_SOLUTION_REPO     agent-solution 仓库地址（默认 https://gitcode.com/openJiuwen/agent-solution.git）
-#   EVOAGENT_SOLUTION_BRANCH   仓库分支（默认 common）
+#   EVOAGENT_SOLUTION_REPO   agent-solution 仓库地址（默认 https://gitcode.com/openJiuwen/agent-solution.git）
+#   EVOAGENT_SOLUTION_BRANCH 仓库分支（默认 common）
+#   EVOAGENT_SOLUTION_DIR    agent-solution 本地目录（默认 $HOME/EvoAgent/agent-solution）
 #   EVOAGENT_SKIP_PULL      设置为 1 跳过代码拉取（同 --skip-pull）
 #   EVOAGENT_CORE_REPO      agent-core 仓库地址（默认 https://gitcode.com/openJiuwen/agent-core.git）
 #   EVOAGENT_CORE_BRANCH    agent-core 仓库分支（默认 main）
@@ -51,7 +52,7 @@ error() { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 # ── 参数解析 ──────────────────────────────────────────────────────────
 SKIP_PULL="${EVOAGENT_SKIP_PULL:-0}"
 LOCAL_MODE=0
-AGENT_SOLUTION_DIR="$HOME/EvoAgent/agent-solution"
+AGENT_SOLUTION_DIR="${EVOAGENT_SOLUTION_DIR:-$HOME/EvoAgent/agent-solution}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -87,6 +88,14 @@ AGENT_CORE_DIR="$HOME/EvoAgent/agent-core"
 # local 模式下 openjiuwen 版本号
 CORE_VERSION="${EVOAGENT_CORE_VERSION:-0.1.13}"
 
+# ── 前置依赖检查 ────────────────────────────────────────────────────
+require_cmd() {
+    command -v "$1" >/dev/null 2>&1 || error "缺少依赖命令: $1（请先安装）"
+}
+require_cmd git
+require_cmd python3
+require_cmd docker
+
 # ── 模式提示 ──────────────────────────────────────────────────────────
 if [ "$LOCAL_MODE" -eq 1 ]; then
     info "模式: local（从 PyPI 下载 openjiuwen==${CORE_VERSION}）"
@@ -95,7 +104,7 @@ else
 fi
 
 # ── 1. 同步最新代码（可跳过）───────────────────────────────────────────
-info "=== 步骤 1/4: 同步 agent-solution 代码 ==="
+info "=== 步骤 1/5: 同步 agent-solution 代码 ==="
 
 if [ "$SKIP_PULL" -eq 1 ]; then
     info "跳过代码拉取（--skip-pull 指定），使用本地代码"
@@ -134,9 +143,9 @@ if [ "$LOCAL_MODE" -eq 1 ]; then
         "openjiuwen==${CORE_VERSION}" \
     || error "下载 openjiuwen==${CORE_VERSION} 失败，请检查版本号或 pip 源配置"
 
-    WHEEL_FILE=$(find "$CORE_DOWNLOAD_DIR" -name "openjiuwen-*.whl" -type f 2>/dev/null | head -1)
+    WHEEL_FILE=$(find "$CORE_DOWNLOAD_DIR" -name "openjiuwen-*.whl" -type f -print -quit 2>/dev/null)
     if [ -z "$WHEEL_FILE" ]; then
-        WHEEL_FILE=$(find "$CORE_DOWNLOAD_DIR" -name "openjiuwen-*.tar.gz" -type f 2>/dev/null | head -1)
+        WHEEL_FILE=$(find "$CORE_DOWNLOAD_DIR" -name "openjiuwen-*.tar.gz" -type f -print -quit 2>/dev/null)
         if [ -z "$WHEEL_FILE" ]; then
             error "未找到下载的 openjiuwen 包文件"
         fi
@@ -144,9 +153,10 @@ if [ "$LOCAL_MODE" -eq 1 ]; then
         warn "将尝试在本地构建 wheel ..."
 
         BUILD_TMP=$(mktemp -d)
+        trap 'rm -rf "$CORE_DOWNLOAD_DIR" "$BUILD_TMP"' EXIT
         python3 -m pip install --no-cache-dir build
         python3 -m build --wheel --outdir "$BUILD_TMP" "$WHEEL_FILE"
-        WHEEL_FILE=$(find "$BUILD_TMP" -name "openjiuwen-*.whl" -type f 2>/dev/null | head -1)
+        WHEEL_FILE=$(find "$BUILD_TMP" -name "openjiuwen-*.whl" -type f -print -quit 2>/dev/null)
         if [ -z "$WHEEL_FILE" ]; then
             error "从源码包构建 wheel 失败"
         fi
@@ -183,7 +193,7 @@ else
     python3 -m build --wheel --outdir dist/
 
     info "查找生成的 wheel 文件..."
-    WHEEL_FILE=$(find "$AGENT_CORE_DIR/dist" -name "openjiuwen-*.whl" -type f 2>/dev/null | head -1)
+    WHEEL_FILE=$(find "$AGENT_CORE_DIR/dist" -name "openjiuwen-*.whl" -type f -print -quit 2>/dev/null)
 
     if [ -z "$WHEEL_FILE" ]; then
         error "wheel 构建失败，未找到生成的 wheel 文件"
@@ -205,7 +215,7 @@ EVOAGENT_DIR="$AGENT_SOLUTION_DIR/$EVOAGENT_REL_PATH"
 mkdir -p "$EVOAGENT_DIR/vendor"
 
 if [ "$SKIP_PULL" -eq 1 ] && [ "$LOCAL_MODE" -eq 0 ]; then
-    WHEEL_FILE=$(find "$EVOAGENT_DIR/vendor" -name "openjiuwen-*.whl" -type f 2>/dev/null | head -1)
+    WHEEL_FILE=$(find "$EVOAGENT_DIR/vendor" -name "openjiuwen-*.whl" -type f -print -quit 2>/dev/null)
     if [ -z "$WHEEL_FILE" ]; then
         error "未找到 vendor wheel 文件，请先构建 agent-core 或使用 --local 模式"
     fi

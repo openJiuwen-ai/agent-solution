@@ -567,6 +567,29 @@ async def test_runner_no_progress_callback_empty_val_scores(
     assert call_kwargs["val_per_epoch_scores"] == ()
 
 
+async def test_runner_console_style_callback_falls_back_to_trainer_gate_scores(
+    tmp_path: Path,
+    make_harness: Callable[[], SimpleNamespace],
+) -> None:
+    """CLI callback may print progress without exposing API trend attributes."""
+    h = make_harness()
+    h.adapter.skill_content.return_value = "# content"
+    h.trainer.gate_epoch_scores = [
+        {"base_score": 0.8, "candidate_score": 0.7},
+    ]
+    console_style_callback = SimpleNamespace()
+
+    await h.run(
+        _make_request(),
+        _make_config(tmp_path),
+        progress_callback=console_style_callback,
+    )
+
+    call_kwargs = h.rf_cls.call_args.kwargs
+    assert call_kwargs["val_per_epoch_scores"] == (0.7,)
+    assert call_kwargs["val_per_epoch_case_scores"] == []
+
+
 # ── A5: val per-case 透传（baseline + per-epoch）──
 
 

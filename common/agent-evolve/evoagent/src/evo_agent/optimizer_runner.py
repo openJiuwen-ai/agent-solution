@@ -774,14 +774,20 @@ async def run_optimization(
         # 报告趋势图用候选 fresh eval 分数（每轮真实评估，会波动）；门控赢家
         # （val_per_epoch_scores，单调非降）仅 ProgressCallback 内部用于 improved 判定。
         gate_epoch_scores = trainer.gate_epoch_scores
+        # ProgressCallback（API）会采集趋势与 per-case 明细；CLI 的
+        # ConsoleProgressCallback 只负责打印，不提供这些 API 专用属性。runner
+        # 接受任意 vendor callback，因此不能假设传入对象一定是 ProgressCallback。
+        callback_candidate_scores = getattr(
+            progress_callback, "candidate_per_epoch_scores", None
+        )
         val_candidate_scores = (
-            tuple(progress_callback.candidate_per_epoch_scores)
-            if progress_callback
+            tuple(callback_candidate_scores)
+            if callback_candidate_scores is not None
             else tuple(float(item["candidate_score"]) for item in gate_epoch_scores)
         )
-        val_score_before = progress_callback.val_score_before if progress_callback else 0.0
-        val_per_epoch_case_scores = (
-            list(progress_callback.val_per_epoch_case_scores) if progress_callback else []
+        val_score_before = float(getattr(progress_callback, "val_score_before", 0.0))
+        val_per_epoch_case_scores = list(
+            getattr(progress_callback, "val_per_epoch_case_scores", [])
         )
         num_val_cases = len(dataset.val_cases) if hasattr(dataset, "val_cases") else 0
         # managed-doc 上下文交给 ReportFormatter（T12 消费：写 final/diff artifact +

@@ -4,8 +4,9 @@
 
 package com.openjiuwen.example.deepresearch.customrest;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
 import com.openjiuwen.service.app.custom.rest.CustomRestProtocolAdapter;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
 
 import org.a2aproject.sdk.spec.Message;
 import org.a2aproject.sdk.spec.MessageSendParams;
